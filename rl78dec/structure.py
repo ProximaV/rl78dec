@@ -17,7 +17,7 @@ class SLabel:
 class SGoto:
     def __init__(self, ea): self.ea = ea
 class SRet:
-    pass
+    def __init__(self, val=None): self.val = val
 class SIf:
     def __init__(self, cond, then, els): self.cond = cond; self.then = then; self.els = els
 class SIfGoto:
@@ -25,6 +25,11 @@ class SIfGoto:
 class SWhile:
     def __init__(self, body, cond=None, dowhile=False):
         self.body = body; self.cond = cond; self.dowhile = dowhile
+class SSwitch:
+    def __init__(self, expr, cases, default=None):
+        self.expr = expr
+        self.cases = cases          # [(list_of_vals, body_nodes)]
+        self.default = default      # body_nodes or None
 class SBreak:
     pass
 class SContinue:
@@ -47,7 +52,7 @@ def cond_expr(branch):
     flag, c = branch.flag, branch.cond
     if flag is None:
         return ir.IntrExpr(_FLAG[c], [])
-    if flag.kind in ("cmp", "sub"):
+    if flag.kind in ("cmp", "sub", "cmp0"):
         return ir.Bin(_REL[c], flag.a, flag.b)
     if flag.kind == "result":
         if c in ("z", "nz"):
@@ -77,6 +82,7 @@ class _Structurer:
         self.idx = {b.start: i for i, b in enumerate(self.order)}
         self.blocks = self.order
         self._open = set()
+        self._handled = set()
 
     def run(self):
         return self._emit(0, len(self.blocks), loop=None)
@@ -94,18 +100,92 @@ class _Structurer:
                     latch = j
         return latch
 
+    def _ret_val(self, block):
+        for s in reversed(block.stmts):
+            if isinstance(s, ir.Ret):
+                return s.val
+        return None
+
     def _body_stmts(self, block):
         out = []
         for s in block.stmts:
-            if isinstance(s, (ir.Goto, ir.Branch, ir.Ret, ir.Nop, ir.Compare)):
+            if isinstance(s, (ir.Goto, ir.Branch, ir.Ret, ir.Nop, ir.Compare, ir.Switch)):
                 continue
             out.append(SStmt(s))
         return out
+
+
+    def _emit_switch(self, b, lo, hi, loop):
+        sw = next((s for s in b.stmts if isinstance(s, ir.Switch)), None)
+        if sw is None:
+            return None, None
+
+        target_to_vals = {}
+        for val, tgt in sorted(sw.cases.items()):
+            if tgt and tgt != 0 and tgt != sw.default:
+                target_to_vals.setdefault(tgt, []).append(val)
+
+        case_succs = set()
+        for tgt in target_to_vals.keys():
+            ti = self.idx.get(tgt)
+            if ti is not None:
+                tb = self.blocks[ti]
+                for _, s_tgt in tb.succ:
+                    if s_tgt not in target_to_vals:
+                        case_succs.add(s_tgt)
+
+        follow_ea = None
+        if len(case_succs) == 1:
+            cand = next(iter(case_succs))
+            if self._in_range(cand, lo, hi):
+                follow_ea = cand
+
+        cases = []
+        for tgt, vals in target_to_vals.items():
+            ti = self.idx.get(tgt)
+            if ti is not None:
+                c_body = []
+                c_body.extend(self._body_stmts(self.blocks[ti]))
+                t_term = self.blocks[ti].term
+                if t_term == "ret":
+                    c_body.append(SRet(self._ret_val(self.blocks[ti])))
+                elif self.blocks[ti].succ:
+                    s_tgt = self.blocks[ti].succ[0][1]
+                    if s_tgt == follow_ea:
+                        c_body.append(SBreak())
+                    else:
+                        self._emit_edge(c_body, s_tgt, lo, hi, loop, fall_i=None)
+                cases.append((vals, c_body))
+                self._handled.add(ti)
+            else:
+                cases.append((vals, [SGoto(tgt)]))
+
+        default_body = None
+        if sw.default and sw.default in self.idx:
+            di = self.idx[sw.default]
+            default_body = self._body_stmts(self.blocks[di])
+            t_term = self.blocks[di].term
+            if t_term == "ret":
+                default_body.append(SRet(self._ret_val(self.blocks[di])))
+            elif self.blocks[di].succ:
+                s_tgt = self.blocks[di].succ[0][1]
+                if s_tgt == follow_ea:
+                    default_body.append(SBreak())
+                else:
+                    self._emit_edge(default_body, s_tgt, lo, hi, loop, fall_i=None)
+            self._handled.add(di)
+
+        node = SSwitch(sw.expr, cases, default=default_body)
+        nxt = self.idx.get(follow_ea) if follow_ea is not None else None
+        return node, nxt
 
     def _emit(self, lo, hi, loop):
         out = []
         i = lo
         while i < hi:
+            if i in self._handled:
+                i += 1
+                continue
             b = self.blocks[i]
             out.append(SLabel(b.start))
 
@@ -118,10 +198,20 @@ class _Structurer:
 
             out.extend(self._body_stmts(b))
             term = b.term
+            if term == "switch":
+                node, nxt = self._emit_switch(b, lo, hi, loop)
+                if node is not None:
+                    out.append(node)
+                    if nxt is not None and nxt > i:
+                        i = nxt
+                    else:
+                        i += 1
+                    continue
             if term == "ret":
-                out.append(SRet())
+                out.append(SRet(self._ret_val(b)))
                 i += 1
                 continue
+
             if term == "goto":
                 tgt = b.succ[0][1]
                 self._emit_edge(out, tgt, lo, hi, loop, fall_i=i + 1)

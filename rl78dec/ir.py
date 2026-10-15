@@ -44,6 +44,37 @@ class Reg(Expr):
         return hash(("reg", self.name))
 
 
+class Var(Expr):
+    __slots__ = ("name", "width")
+
+    def __init__(self, name, width="b"):
+        self.name = name
+        self.width = width
+
+    def __eq__(self, o):
+        return isinstance(o, Var) and o.name == self.name
+
+    def __hash__(self):
+        return hash(("var", self.name))
+
+
+class StackVar(Var):
+    """A stack frame variable or argument slot."""
+    __slots__ = ("offset", "is_arg")
+
+    def __init__(self, name, width="b", offset=0, is_arg=False):
+        super().__init__(name, width)
+        self.offset = offset
+        self.is_arg = is_arg
+
+    def __eq__(self, o):
+        return isinstance(o, StackVar) and o.name == self.name and o.offset == self.offset
+
+    def __hash__(self):
+        return hash(("stackvar", self.name, self.offset))
+
+
+
 class Mem(Expr):
     """A memory access at address *addr* (an Expr), width b/w.  ``es`` marks the
     ES: far-data prefix; ``name`` is an optional symbolic label (SFR/saddr)."""
@@ -120,6 +151,15 @@ class Assign:
         self.flag = flag
 
 
+class Swap:
+    __slots__ = ("ea", "a", "b")
+
+    def __init__(self, ea, a, b):
+        self.ea = ea
+        self.a = a
+        self.b = b
+
+
 class Compare:
     __slots__ = ("ea", "flag")
 
@@ -129,12 +169,15 @@ class Compare:
 
 
 class Call:
-    __slots__ = ("ea", "target", "expr")
+    __slots__ = ("ea", "target", "expr", "args", "dst")
 
-    def __init__(self, ea, target=None, expr=None):
+    def __init__(self, ea, target=None, expr=None, args=None, dst=None):
         self.ea = ea
         self.target = target        # ea for a direct call
         self.expr = expr            # Expr for an indirect call
+        self.args = list(args) if args else []
+        self.dst = dst
+
 
 
 class Intrinsic:
@@ -148,11 +191,13 @@ class Intrinsic:
 
 
 class Ret:
-    __slots__ = ("ea", "kind")
+    __slots__ = ("ea", "kind", "val")
 
-    def __init__(self, ea, kind="ret"):
+    def __init__(self, ea, kind="ret", val=None):
         self.ea = ea
         self.kind = kind
+        self.val = val
+
 
 
 class Goto:
@@ -180,3 +225,14 @@ class Nop:
 
     def __init__(self, ea):
         self.ea = ea
+
+
+class Switch:
+    __slots__ = ("ea", "expr", "cases", "default", "table_ea")
+
+    def __init__(self, ea, expr, cases, default=None, table_ea=None):
+        self.ea = ea
+        self.expr = expr
+        self.cases = cases
+        self.default = default
+        self.table_ea = table_ea

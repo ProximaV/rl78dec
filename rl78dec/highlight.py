@@ -16,7 +16,8 @@ C_KEYWORDS = frozenset((
 ))
 C_TYPES = frozenset((
     "void", "char", "short", "int", "long", "unsigned", "signed",
-    "const", "u8", "u16", "u32",
+    "const", "u8", "u16", "u32", "uint8_t", "uint16_t", "uint32_t",
+    "int8_t", "int16_t", "int32_t", "bool",
 ))
 # pseudo-calls the back-end emits for opaque / cpu-control opcodes
 INTRINSICS = frozenset((

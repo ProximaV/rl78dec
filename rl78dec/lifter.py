@@ -24,7 +24,8 @@ def op_expr(op):
         addr = base if op.disp == 0 else ir.Bin("+", base, ir.Const(op.disp, "b"))
         return ir.Mem(addr, op.width, op.es)
     if m == "idx16":
-        addr = ir.Bin("+", ir.Const(op.disp, "a"), ir.Reg(op.base_reg))
+        disp = (0xF0000 | (op.disp & 0xFFFF)) if not op.es else op.disp
+        addr = ir.Bin("+", ir.Const(disp, "a"), ir.Reg(op.base_reg))
         return ir.Mem(addr, op.width, op.es)
     if m == "hloff":
         return ir.Mem(ir.Bin("+", ir.Reg("hl"), ir.Reg(op.base_reg)), "b", op.es)
@@ -67,40 +68,50 @@ def lift_insn(ins):
     if m in ("clrb", "clrw"):
         return [ir.Assign(ea, e(0), ir.Const(0, _w(ops[0])))]
     if m in ("xch", "xchw"):
-        return [ir.Intrinsic(ea, "xch", [e(0), e(1)])]
+        return [ir.Swap(ea, e(0), e(1))]
     if m == "movs":
         return [ir.Intrinsic(ea, "movs", [e(0), e(1)], note="[hl+]=x, decw c")]
 
     # --- arithmetic / logic ------------------------------------------------
     if m in _ALU:
         dst, src = e(0), e(1)
-        if m in ("sub", "subc", "subw"):
+        if m == "addc":
+            rhs = ir.Bin("+", ir.Bin("+", dst, src), ir.Reg("cy"))
+            flag = ir.FlagDef("result", a=dst)
+        elif m == "subc":
+            rhs = ir.Bin("-", ir.Bin("-", dst, src), ir.Reg("cy"))
+            flag = ir.FlagDef("sub", a=dst, b=src)
+        elif m in ("sub", "subw"):
+            rhs = ir.Bin("-", dst, src)
             flag = ir.FlagDef("sub", a=dst, b=src)
         else:
+            rhs = ir.Bin(_ALU[m], dst, src)
             flag = ir.FlagDef("result", a=dst)
-        return [ir.Assign(ea, dst, ir.Bin(_ALU[m], dst, src), flag=flag)]
+        return [ir.Assign(ea, dst, rhs, flag=flag)]
     if m in ("cmp", "cmpw", "cmps"):
         return [ir.Compare(ea, ir.FlagDef("cmp", a=e(0), b=e(1)))]
     if m == "cmp0":
-        return [ir.Compare(ea, ir.FlagDef("cmp", a=e(0), b=ir.Const(0)))]
+        return [ir.Compare(ea, ir.FlagDef("cmp0", a=e(0), b=ir.Const(0)))]
     if m in ("inc", "incw"):
         dst = e(0)
+        flag = ir.FlagDef("result", a=dst) if m == "inc" else None
         return [ir.Assign(ea, dst, ir.Bin("+", dst, ir.Const(1, dst.width if isinstance(dst, ir.Reg) else "b")),
-                          flag=ir.FlagDef("result", a=dst))]
+                          flag=flag)]
     if m in ("dec", "decw"):
         dst = e(0)
+        flag = ir.FlagDef("result", a=dst) if m == "dec" else None
         return [ir.Assign(ea, dst, ir.Bin("-", dst, ir.Const(1, dst.width if isinstance(dst, ir.Reg) else "b")),
-                          flag=ir.FlagDef("result", a=dst))]
+                          flag=flag)]
     if m == "mulu":
         return [ir.Assign(ea, ir.Reg("ax"), ir.IntrExpr("mulu", [ir.Reg("a"), ir.Reg("x")]))]
 
     # --- shifts / rotates --------------------------------------------------
     if m in ("shl", "shlw"):
-        return [ir.Assign(ea, e(0), ir.Bin("<<", e(0), e(1)), flag=ir.FlagDef("result", a=e(0)))]
+        return [ir.Assign(ea, e(0), ir.Bin("<<", e(0), e(1)))]
     if m in ("shr", "shrw"):
-        return [ir.Assign(ea, e(0), ir.Bin(">>", e(0), e(1)), flag=ir.FlagDef("result", a=e(0)))]
+        return [ir.Assign(ea, e(0), ir.Bin(">>", e(0), e(1)))]
     if m in ("sar", "sarw"):
-        return [ir.Assign(ea, e(0), ir.IntrExpr("sar", [e(0), e(1)]), flag=ir.FlagDef("result", a=e(0)))]
+        return [ir.Assign(ea, e(0), ir.IntrExpr("sar", [e(0), e(1)]))]
     if m in ("ror", "rol", "rorc", "rolc", "rolwc"):
         return [ir.Assign(ea, e(0), ir.IntrExpr(m, [e(0)]))]
 

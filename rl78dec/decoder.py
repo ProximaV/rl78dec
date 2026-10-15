@@ -43,7 +43,7 @@ class Operand:
 
 
 class Insn:
-    __slots__ = ("ea", "size", "mnem", "ops", "es", "raw")
+    __slots__ = ("ea", "size", "mnem", "ops", "es", "raw", "switch")
 
     def __init__(self, ea):
         self.ea = ea
@@ -52,6 +52,7 @@ class Insn:
         self.ops = []
         self.es = False
         self.raw = b""
+        self.switch = None
 
     def op(self, i):
         return self.ops[i] if i < len(self.ops) else None
@@ -184,8 +185,8 @@ class _Dec:
     @staticmethod
     def _convert(op):
         """SFR/abs addresses that name SP/PSW/CS/ES become registers."""
-        m = {0xFFFF8: "sp", 0xFFFFA: "psw", 0xFFFFC: "cs", 0xFFFFD: "es"}
-        name = m.get(op.addr)
+        from . import regs
+        name = regs.special_reg(op.addr, op.width)
         if name is None:
             return op
         if op.mode == "bit":
@@ -206,7 +207,7 @@ class _Dec:
 # prefix maps
 # ---------------------------------------------------------------------------
 
-_ALU8 = ("add", "addc", "sub", "subc", "cmp", "and", "or", "xor")
+_ALU8 = ("add", "addc", "sub", "subc", "cmp", "and", "or", "xor", "xch")
 
 
 def _map31(d):
@@ -618,10 +619,19 @@ def target_of(ins):
     return None
 
 
-def _succ(ins):
+def _succ(ins, image=None, base=0):
+    if getattr(ins, "switch", None) is not None:
+        return [("switch", t) for t in ins.switch.targets]
     m = ins.mnem
     out = []
     tgt = target_of(ins)
+    if m in isa.SKIP:
+        out.append(("fall", ins.ea + ins.size))
+        if image is not None:
+            nxt = decode_one(image, ins.ea + ins.size, base)
+            if nxt and nxt.size > 0:
+                out.append(("jump", ins.ea + ins.size + nxt.size))
+        return out
     if m == "br":
         if tgt is not None:
             out.append(("jump", tgt))
@@ -655,7 +665,12 @@ def decode(image, entries, base=0):
         if ins is None or ins.size == 0:
             continue
         insns[ea] = ins
-        for how, tgt in _succ(ins):
+        if ins.mnem == "br" and ins.ops and ins.ops[0].mode == "reg" and ins.ops[0].reg == "ax":
+            from . import switch_table
+            sw = switch_table.detect_switch(image, insns, ins, base)
+            if sw:
+                ins.switch = sw
+        for how, tgt in _succ(ins, image=image, base=base):
             if tgt is None:
                 continue
             if how == "call":

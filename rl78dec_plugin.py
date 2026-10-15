@@ -126,6 +126,11 @@ class Rl78DecPlugin(ida_idaapi.plugin_t):
                 pass
         del _hotkeys[:]
         del _views[:]
+        try:
+            from rl78dec import view
+            view.cleanup()
+        except Exception:
+            pass
 
 
 def PLUGIN_ENTRY():
