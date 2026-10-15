@@ -10,7 +10,7 @@ and the Kirk/Spock ``startrekdec``:
     decoder -> lifter -> cfg -> opt -> structure -> cgen
 """
 
-from . import decoder, cfg, opt, structure, cgen, loader
+from . import decoder, cfg, opt, structure, cgen, loader, frame, abi, spill, vars
 from .names import Namer
 
 __version__ = "0.1.0"
@@ -56,9 +56,13 @@ def decompile_image(image, entries, base=0, cell_names=None, code_names=None):
     namer = Namer(cell_names=cell_names, code_names=code_names)
     out = {}
     for entry, f in funcs.items():
+        frame_info = frame.analyze_frame(f)
+        spill.eliminate_spills(f, frame_info)
         opt.optimize(f)
+        sig = abi.analyze_calling_convention(f, frame_info)
+        vars.recover_variables(f, sig, frame_info)
         tree = structure.structure(f)
-        lines = cgen.generate(f, tree, namer)
+        lines = cgen.generate(f, tree, namer, frame_info=frame_info, sig=sig)
         out[entry] = Function(entry, namer.code(entry), f, tree, lines)
     return Program(image, insns, out, namer)
 

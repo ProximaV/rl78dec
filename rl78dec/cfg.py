@@ -45,6 +45,8 @@ def _skip_target(insns, ea):
 
 
 def _succ(insns, ins):
+    if getattr(ins, "switch", None) is not None:
+        return [("switch", t) for t in ins.switch.targets]
     m = ins.mnem
     ea = ins.ea
     nxt = ea + ins.size
@@ -72,7 +74,7 @@ def _collect_body(insns, entry, entry_set):
             continue
         body.add(ea)
         for how, tgt in _succ(insns, insns[ea]):
-            if tgt in insns and (tgt == entry or tgt not in entry_set):
+            if tgt in insns and (tgt == entry or how == "switch" or tgt not in entry_set):
                 work.append(tgt)
     return body
 
@@ -82,12 +84,13 @@ def _leaders(insns, body):
     for ea in body:
         ins = insns[ea]
         for how, tgt in _succ(insns, ins):
-            if how in ("cond", "jump") and tgt in body:
+            if how in ("cond", "jump", "switch") and tgt in body:
                 leaders.add(tgt)
         # instruction after any control transfer starts a block
         if ins.mnem in isa.COND_BRANCH or ins.mnem in isa.BIT_BRANCH \
                 or ins.mnem in isa.SKIP or ins.mnem == "call" or ins.mnem == "callt" \
-                or ins.mnem in isa.STOP or ins.mnem in isa.RET:
+                or ins.mnem in isa.STOP or ins.mnem in isa.RET \
+                or getattr(ins, "switch", None) is not None:
             nxt = ea + ins.size
             if nxt in body:
                 leaders.add(nxt)
@@ -121,7 +124,9 @@ def build_func(insns, entry, entry_set):
         succ = _succ(insns, ins)
         nxt = ea + ins.size
         term = None
-        if ins.mnem == "br" and target_of(ins) is not None:
+        if getattr(ins, "switch", None) is not None:
+            term = ("switch", succ)
+        elif ins.mnem == "br" and target_of(ins) is not None:
             term = ("goto", succ)
         elif ins.mnem == "br":
             term = ("ret", [])                       # indirect br: ends block
@@ -136,10 +141,22 @@ def build_func(insns, entry, entry_set):
             cur = None
 
     for b in f.blocks.values():
+        dispatch_eas = set()
         for ins in b.insns:
+            if getattr(ins, "switch", None) is not None and ins.switch.dispatch_eas:
+                dispatch_eas.update(ins.switch.dispatch_eas)
+        for ins in b.insns:
+            if ins.ea in dispatch_eas:
+                if getattr(ins, "switch", None) is not None:
+                    b.stmts.append(ir.Switch(ins.ea, ins.switch.expr, ins.switch.cases,
+                                             default=ins.switch.default_ea, table_ea=ins.switch.table_ea))
+                continue
             if ins.mnem == "call" and target_of(ins) is not None:
                 f.calls.add(target_of(ins))
-            if ins.mnem in isa.SKIP:
+            if getattr(ins, "switch", None) is not None:
+                b.stmts.append(ir.Switch(ins.ea, ins.switch.expr, ins.switch.cases,
+                                         default=ins.switch.default_ea, table_ea=ins.switch.table_ea))
+            elif ins.mnem in isa.SKIP:
                 b.stmts.append(_skip_branch(insns, ins))
             else:
                 b.stmts.extend(lift_insn(ins))
@@ -182,10 +199,23 @@ def _resolve_flags(f):
 
 
 def build_functions(insns, calls, extra_entries=()):
-    entry_set = {e for e in (set(calls) | set(extra_entries)) if e in insns}
+    switch_targets = set()
+    for ins in insns.values():
+        if getattr(ins, "switch", None) is not None:
+            switch_targets.update(ins.switch.targets)
+
+    initial_entries = (set(calls) | set(extra_entries)) - (switch_targets - set(calls))
+    entry_set = {e for e in initial_entries if e in insns}
+
     funcs = {}
+    subsumed = set()
     for entry in sorted(entry_set):
+        if entry in subsumed:
+            continue
         fn = build_func(insns, entry, entry_set)
         if fn is not None:
             funcs[entry] = fn
+            for b_ea in fn.blocks:
+                if b_ea != entry and b_ea in entry_set:
+                    subsumed.add(b_ea)
     return funcs

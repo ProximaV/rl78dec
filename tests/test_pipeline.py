@@ -47,6 +47,11 @@ def test_decode_fields():
     assert ins.mnem == "set1" and ins.ops[0].reg == "cy"
     ins = decoder.decode_one(_img([0x71, 0x88]), 0)
     assert ins.mnem == "clr1" and ins.ops[0].reg == "cy"
+
+    # 0x61 map: xch a, b = 61 8B
+    ins = decoder.decode_one(_img([0x61, 0x8B]), 0)
+    assert ins.mnem == "xch" and ins.ops[0].reg == "a" and ins.ops[1].reg == "b"
+
     print("ok  test_decode_fields")
 
 
@@ -68,14 +73,85 @@ def test_loop_structuring():
     fn = prog.funcs[0]
     text = "\n".join(fn.lines)
     assert "do {" in text and "while (" in text and "!= 0" in text, text
-    assert "b = b - 1;" in text, text
+    assert "v0 = v0 - 1;" in text, text
     assert text.count("{") == text.count("}"), text
     print("ok  test_loop_structuring\n")
     print(text)
+
+
+def test_switch_structuring():
+    raw = bytes.fromhex(
+        "5c1f9170f1312d0468d3144100118a029efc11aa00410f61cb00a4d30000a4d30000"
+        "4ed40000a6d300000000000000000000b8d300000000000000000000000000000000"
+        "00000000000000000000cad3000000000000d70031171169c6ddf1041fde1451ff11"
+        "9a00d700c331171169c6ddf1312d0425de14c2ee5a00c331171169c6ddf1312d042d"
+        "de14c2ee4800f61129efdd08045cdd14c3fe3a00c2c3d1df211129efdd7553012c08"
+        "de02f3655201d1dd05311791dffb110958dd617a111858dd118f54ddc2614adf0a11"
+        "8f53dd5cf7119f53ddd7112907de614add1c701189614adf0360119911290dde618a"
+        "08112807de618a11280dded711ca00fff1d7c331171169c6ddf10413de14c2eec6ff"
+        "1138"
+    )
+    buf = bytearray(0x10000)
+    buf[0xD34E:0xD34E + len(raw)] = raw
+    prog = decompile_image(buf, entries=[0xD34E])
+    fn = prog.funcs[0xD34E]
+    text = "\n".join(fn.lines)
+    assert "switch (" in text, text
+    assert "case 0:" in text and "case 1:" in text, text
+    assert "case 2:" in text and "case 3:" in text, text
+    assert "case 6:" in text and "case 13:" in text, text
+    assert "break;" in text, text
+    assert "return;" in text, text
+    print("ok  test_switch_structuring\n")
+    print(text)
+
+
+def test_coalesce_arithmetic():
+    # Consecutive incw ax (0xA1, 0xA1, 0xD7) -> + 2
+    prog = decompile_image(_img([0xA1, 0xA1, 0xD7]), entries=[0])
+    text = "\n".join(prog.funcs[0].lines)
+    assert "+ 2" in text, text
+
+    # Consecutive decw bc (0xB3, 0xB3, 0xD7) -> - 2
+    prog = decompile_image(_img([0xB3, 0xB3, 0xD7]), entries=[0])
+    text = "\n".join(prog.funcs[0].lines)
+    assert "- 2" in text, text
+
+    print("ok  test_coalesce_arithmetic")
+
+
+def test_global_memory_access():
+    # Loop copying 4 bytes using 16-bit word moves with C index:
+    #   MOV C, #4
+    # loop:
+    #   DEC C
+    #   DEC C
+    #   MOVW AX, [C+0xFE48]
+    #   MOVW [C+0xFE4C], AX
+    #   BNZ loop
+    #   MOV A, !0xFFE50
+    #   RET
+    raw = bytes([0x52, 0x04, 0x92, 0x92, 0x69, 0x48, 0xFE, 0x68, 0x4C, 0xFE, 0xDF, 0xF6, 0x8F, 0x50, 0xFE, 0xD7])
+    buf = bytearray(0x100)
+    buf[:len(raw)] = raw
+    prog = decompile_image(buf, entries=[0], cell_names={
+        0xFFE4C: "byte_FFE4C",
+        0xFFE48: "byte_FFE48",
+        0xFFE50: "byte_FFE50",
+    })
+    text = "\n".join(prog.funcs[0].lines)
+    assert "byte_FFE4C[v0] = byte_FFE48[v0];" in text, text
+    assert "return byte_FFE50;" in text or "byte_FFE50" in text, text
+    assert "mem16[" not in text, text
+
+    print("ok  test_global_memory_access")
 
 
 if __name__ == "__main__":
     test_decode_fields()
     test_all_first_bytes()
     test_loop_structuring()
+    test_switch_structuring()
+    test_coalesce_arithmetic()
+    test_global_memory_access()
     print("\nall tests passed")

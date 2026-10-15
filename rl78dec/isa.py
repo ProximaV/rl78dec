@@ -41,18 +41,52 @@ def saddr_abs(rel):
 # flag effects  --  which mnemonics set Z / CY, for branch-condition recovery
 # ---------------------------------------------------------------------------
 # RL78 conditional branches read CY (bc/bnc), Z (bz/bnz) and CY|Z (bh/bnh).
-# Only the arithmetic/compare group updates them the way the branches expect.
-SETS_Z = frozenset((
-    "cmp", "cmp0", "cmpw", "cmps", "add", "addc", "sub", "subc",
-    "and", "or", "xor", "inc", "dec", "addw", "subw",
-    "shl", "shr", "sar", "shlw", "shrw", "sarw", "mulu",
-))
-SETS_CY = frozenset((
-    "cmp", "cmpw", "cmps", "add", "addc", "sub", "subc",
-    "addw", "subw", "shl", "shr", "sar", "shlw", "shrw", "sarw",
-    "ror", "rol", "rorc", "rolc", "rolwc", "set1", "clr1", "not1", "mov1",
-    "and1", "or1", "xor1",
-))
+# Mapping: mnem -> (Z_effect, CY_effect)
+#   Z_effect:  "def" (sets Z from result/cmp), None (preserves Z)
+#   CY_effect: "def" (sets CY from carry/borrow/shift), "zero" (clears CY to 0), None (preserves CY)
+FLAG_FX = {
+    # Z & CY
+    "add":   ("def", "def"),
+    "addc":  ("def", "def"),
+    "sub":   ("def", "def"),
+    "subc":  ("def", "def"),
+    "addw":  ("def", "def"),
+    "subw":  ("def", "def"),
+    "cmp":   ("def", "def"),
+    "cmpw":  ("def", "def"),
+    "cmps":  ("def", "def"),
+    "movs":  ("def", "def"),
+    # Z only
+    "and":   ("def", None),
+    "or":    ("def", None),
+    "xor":   ("def", None),
+    "inc":   ("def", None),
+    "dec":   ("def", None),
+    # CY only
+    "shl":   (None, "def"),
+    "shr":   (None, "def"),
+    "sar":   (None, "def"),
+    "shlw":  (None, "def"),
+    "shrw":  (None, "def"),
+    "sarw":  (None, "def"),
+    "ror":   (None, "def"),
+    "rol":   (None, "def"),
+    "rorc":  (None, "def"),
+    "rolc":  (None, "def"),
+    "rolwc": (None, "def"),
+    "set1":  (None, "def"),
+    "clr1":  (None, "def"),
+    "not1":  (None, "def"),
+    "mov1":  (None, "def"),
+    "and1":  (None, "def"),
+    "or1":   (None, "def"),
+    "xor1":  (None, "def"),
+    # CY:=0, Z
+    "cmp0":  ("def", "zero"),
+}
+
+SETS_Z = frozenset(m for m, (z, _) in FLAG_FX.items() if z == "def")
+SETS_CY = frozenset(m for m, (_, cy) in FLAG_FX.items() if cy is not None)
 
 # instructions that end a basic block (unconditional flow / return)
 STOP = frozenset(("br", "ret", "reti", "retb", "brk", "stop"))

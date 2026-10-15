@@ -9,7 +9,7 @@ the decompilation reuses whatever labels the analyst has applied.
 IDA is imported lazily so importing :mod:`rl78dec` outside IDA stays clean.
 """
 
-from . import decoder, cfg, opt, structure, cgen
+from . import decoder, cfg, opt, structure, cgen, frame, abi, spill, vars, db
 from .names import Namer
 from . import Program, Function, BANNER  # noqa: F401
 
@@ -54,6 +54,64 @@ def _entries():
     return sorted(idautils.Functions(0, 0x80000))
 
 
+def _ida_frame_info(ea):
+    try:
+        import ida_funcs, ida_frame, ida_typeinf, ida_ua
+        from ida_idaapi import BADADDR
+        pfn = ida_funcs.get_func(ea)
+        if not pfn:
+            return None
+        tif = ida_typeinf.tinfo_t()
+        members = {}
+        if ida_frame.get_func_frame(tif, pfn):
+            udt = ida_typeinf.udt_type_data_t()
+            if tif.get_udt_details(udt):
+                for m in udt:
+                    members[m.offset // 8] = (m.name, m.size // 8, m.type.dstr())
+
+        off_args = ida_frame.frame_off_args(pfn)
+        stkvars_by_ea = {}
+        cur = pfn.start_ea
+        while cur < pfn.end_ea:
+            insn = ida_ua.insn_t()
+            if ida_ua.decode_insn(insn, cur) > 0:
+                for n in range(8):
+                    op = insn.ops[n]
+                    if op.type == ida_ua.o_void:
+                        break
+                    if op.type == ida_ua.o_displ and op.reg in (11, 12):
+                        soff = ida_frame.calc_stkvar_struc_offset(pfn, insn, n)
+                        if soff != BADADDR:
+                            if soff >= (1 << 63):
+                                soff -= (1 << 64)
+                            m = members.get(soff)
+                            name = m[0] if m else ida_frame.build_stkvar_name(pfn, soff)
+                            size = m[1] if m else (2 if getattr(op, 'dtype', 0) == 1 else 1)
+                            if soff < 0:
+                                is_arg = False
+                                if name.startswith("arg_"):
+                                    name = "var_%X" % abs(soff)
+                            else:
+                                is_arg = (soff >= off_args) if off_args != BADADDR else name.startswith("arg_")
+                            stkvars_by_ea.setdefault(cur, {})[n] = (soff, name, size, is_arg)
+            cur += insn.size if insn.size > 0 else 1
+        return (members, stkvars_by_ea)
+    except Exception:
+        return None
+
+
+def _get_ida_func_proto(ea):
+    """Retrieve C prototype string from IDA's type system if present."""
+    try:
+        import ida_nalt, ida_typeinf
+        tif = ida_typeinf.tinfo_t()
+        if ida_nalt.get_tinfo(tif, ea) and tif.is_func():
+            return tif.dstr()
+    except Exception:
+        pass
+    return None
+
+
 def decompile_program():
     image = _read_image()
     entries = _entries() or [0]
@@ -62,10 +120,24 @@ def decompile_program():
     namer = IdaNamer()
     out = {}
     for entry, f in funcs.items():
+        db_data = db.get_func_data(entry)
+        u_renames = db_data.get("renames", {})
+        u_types = db_data.get("types", {})
+        u_proto = db_data.get("proto") or _get_ida_func_proto(entry)
+
+        ida_info = _ida_frame_info(entry)
+        frame_info = frame.analyze_frame(f, ida_frame_info=ida_info)
+        frame_info.user_renames = u_renames
+        frame_info.user_types = u_types
+
+        spill.eliminate_spills(f, frame_info)
         opt.optimize(f)
+        sig = abi.analyze_calling_convention(f, frame_info, user_proto=u_proto)
+        vars.recover_variables(f, sig, frame_info)
         tree = structure.structure(f)
         out[entry] = Function(entry, namer.code(entry), f, tree,
-                              cgen.generate(f, tree, namer))
+                              cgen.generate(f, tree, namer, frame_info=frame_info, sig=sig,
+                                            user_renames=u_renames, user_types=u_types))
     return Program(image, insns, out, namer)
 
 
@@ -76,11 +148,36 @@ def decompile_one(ea):
     image = _read_image()
     entset = set(_entries()) | {entry}
     insns, _ = decoder.decode(image, entries=[entry] + _entries(), base=0)
+
+    # If the user invoked on an internal switch case fragment, find its parent function
+    for ins in insns.values():
+        if getattr(ins, "switch", None) is not None and entry in ins.switch.targets:
+            parent_f = ida_funcs.get_func(ins.ea)
+            if parent_f and parent_f.start_ea != entry:
+                entry = parent_f.start_ea
+                break
+
     func = cfg.build_func(insns, entry, entset)
     if func is None:
         raise RuntimeError("rl78dec: nothing decoded at 0x%X" % entry)
     namer = IdaNamer()
+
+    db_data = db.get_func_data(entry)
+    u_renames = db_data.get("renames", {})
+    u_types = db_data.get("types", {})
+    u_proto = db_data.get("proto") or _get_ida_func_proto(entry)
+
+    ida_info = _ida_frame_info(entry)
+    frame_info = frame.analyze_frame(func, ida_frame_info=ida_info)
+    frame_info.user_renames = u_renames
+    frame_info.user_types = u_types
+
+    spill.eliminate_spills(func, frame_info)
     opt.optimize(func)
+    sig = abi.analyze_calling_convention(func, frame_info, user_proto=u_proto)
+    vars.recover_variables(func, sig, frame_info)
     tree = structure.structure(func)
     return Function(entry, namer.code(entry), func, tree,
-                    cgen.generate(func, tree, namer, banner=BANNER))
+                    cgen.generate(func, tree, namer, frame_info=frame_info, sig=sig, banner=BANNER,
+                                  user_renames=u_renames, user_types=u_types))
+
