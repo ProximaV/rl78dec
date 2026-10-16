@@ -53,8 +53,9 @@ def _line_ea(line):
 
 
 class _ActionHandler(ida_kernwin.action_handler_t):
-    def __init__(self, callback):
+    def __init__(self, view, callback):
         super().__init__()
+        self.view = view
         self.callback = callback
 
     def activate(self, ctx):
@@ -62,7 +63,12 @@ class _ActionHandler(ida_kernwin.action_handler_t):
         return 1
 
     def update(self, ctx):
-        return ida_kernwin.AST_ENABLE_ALWAYS
+        if not self.view:
+            return ida_kernwin.AST_DISABLE_FOR_WIDGET
+        widget = self.view.GetWidget()
+        if widget and ctx.widget == widget:
+            return ida_kernwin.AST_ENABLE_FOR_WIDGET
+        return ida_kernwin.AST_DISABLE_FOR_WIDGET
 
 
 class _DecompilerView(ida_kernwin.simplecustviewer_t):
@@ -283,7 +289,12 @@ class _DecompilerView(ida_kernwin.simplecustviewer_t):
             return True
         if vkey in (13, 32): # Enter or Space
             return self.jump_disasm()
+        if vkey == 9: # Tab
+            self.toggle_sync()
+            return True
         if vkey == 27: # Esc
+            global _active_viewer
+            _active_viewer = None
             self.Close()
             return True
         return False
@@ -298,11 +309,19 @@ class _ViewHooks(ida_kernwin.UI_Hooks):
         """Automatically follow current function in disassembly when sync is active."""
         if not self.view or not self.view.sync_with_disasm:
             return
+        if _active_viewer is not self.view:
+            return
         pfn = ida_funcs.get_func(ea)
         if pfn is None:
             return
         if pfn.start_ea != self.view.current_func_ea:
             self.view.show_func(pfn.start_ea)
+
+    def widget_invisible(self, widget):
+        """Reset active viewer when the decompiler window is closed."""
+        if self.view and widget == self.view.GetWidget():
+            global _active_viewer
+            _active_viewer = None
 
     def finish_populating_widget_popup(self, widget, popup_handle):
         """Attach decompiler context actions to the right-click popup menu."""
@@ -321,21 +340,21 @@ class _ViewHooks(ida_kernwin.UI_Hooks):
 
 
 def _register_actions(view):
-    """Register IDA actions for popup menu and hotkeys."""
+    """Register IDA actions for popup menu (without global shortcuts that interfere with other windows)."""
     actions = [
-        (ACTION_RENAME, "Rename variable/symbol... (N)", "N", view.on_rename),
-        (ACTION_SET_TYPE, "Set variable/function type... (Y)", "Y", view.on_set_type),
-        (ACTION_TOGGLE_SYNC, "Sync with Disassembly", "Tab", view.toggle_sync),
-        (ACTION_JUMP_DISASM, "Jump to Disassembly (Enter)", "Enter", view.jump_disasm),
-        (ACTION_REFRESH, "Refresh Decompilation (F5)", "F5", lambda: view.show_func(view.current_func_ea)),
+        (ACTION_RENAME, "Rename variable/symbol... (N)", view.on_rename),
+        (ACTION_SET_TYPE, "Set variable/function type... (Y)", view.on_set_type),
+        (ACTION_TOGGLE_SYNC, "Sync with Disassembly (Tab)", view.toggle_sync),
+        (ACTION_JUMP_DISASM, "Jump to Disassembly (Enter)", view.jump_disasm),
+        (ACTION_REFRESH, "Refresh Decompilation (F5)", lambda: view.show_func(view.current_func_ea)),
     ]
-    for action_id, label, shortcut, callback in actions:
+    for action_id, label, callback in actions:
         ida_kernwin.unregister_action(action_id)
         desc = ida_kernwin.action_desc_t(
             action_id,
             label,
-            _ActionHandler(callback),
-            shortcut,
+            _ActionHandler(view, callback),
+            None,
             label
         )
         ida_kernwin.register_action(desc)
@@ -344,15 +363,18 @@ def _register_actions(view):
 def show(function):
     """Open or refresh the dockable decompiler view for the specified function."""
     global _active_viewer, _ui_hooks
-    if _active_viewer is None:
+    if _active_viewer is None or _active_viewer.GetWidget() is None:
         v = _DecompilerView()
         if not v.Create(_VIEW_TITLE):
             return None
         _active_viewer = v
         _register_actions(_active_viewer)
 
-        _ui_hooks = _ViewHooks(_active_viewer)
-        _ui_hooks.hook()
+        if _ui_hooks is None:
+            _ui_hooks = _ViewHooks(_active_viewer)
+            _ui_hooks.hook()
+        else:
+            _ui_hooks.view = _active_viewer
 
     _active_viewer.build_or_refresh(function)
     _active_viewer.Show()

@@ -181,9 +181,65 @@ def test_call_site_recovery():
     print("ok  test_call_site_recovery")
 
 
+def test_call_site_recovery_fallthrough_and_volatile():
+    # 1. Call at end of block with fallthrough to 'a = c' (e.g. usevoltagetable)
+    f1 = cfg.Func(0x3FB0)
+    b1_0 = cfg.Block(0x3FB0)
+    s_call1 = ir.Call(0x3FB0, target=0x36E8D)
+    b1_0.stmts = [s_call1]
+    b1_0.succ = [("fall", 0x3FB4)]
+
+    b1_1 = cfg.Block(0x3FB4)
+    s_assign1 = ir.Assign(0x3FB4, ir.Reg("a"), ir.Reg("c"))
+    b1_1.stmts = [s_assign1, ir.Ret(0x3FB6)]
+    f1.blocks[0x3FB0] = b1_0
+    f1.blocks[0x3FB4] = b1_1
+    fi1 = frame.FrameInfo(f1)
+
+    abi.analyze_calling_convention(f1, fi1)
+    # Return register C must be assigned as destination of call
+    assert isinstance(s_call1.dst, ir.Reg) and s_call1.dst.name == "c"
+    # Assignment 'a = c' must NOT be hidden since 'a' is a volatile register
+    assert id(s_assign1) not in fi1.hidden_stmts
+
+    # 2. Call followed by Compare on C (e.g. voltage_device_connected)
+    f2 = cfg.Func(0x4000)
+    b2_0 = cfg.Block(0x4000)
+    s_call2 = ir.Call(0x4000, target=0x4BF5)
+    b2_0.stmts = [s_call2]
+    b2_0.succ = [("fall", 0x4004)]
+
+    b2_1 = cfg.Block(0x4004)
+    s_cmp2 = ir.Compare(0x4004, ir.FlagDef("cmp0", ir.Reg("c"), ir.Const(0)))
+    b2_1.stmts = [s_cmp2, ir.Ret(0x4006)]
+    f2.blocks[0x4000] = b2_0
+    f2.blocks[0x4004] = b2_1
+    fi2 = frame.FrameInfo(f2)
+
+    abi.analyze_calling_convention(f2, fi2)
+    assert isinstance(s_call2.dst, ir.Reg) and s_call2.dst.name == "c"
+    assert id(s_cmp2) not in fi2.hidden_stmts
+
+    # 3. Call with unused return value (all volatile registers clobbered before use)
+    f3 = cfg.Func(0x5000)
+    b3 = cfg.Block(0x5000)
+    s_call3 = ir.Call(0x5000, target=0x6000)
+    s_clrw_ax = ir.Assign(0x5004, ir.Reg("ax"), ir.Const(0))
+    s_clrw_bc = ir.Assign(0x5006, ir.Reg("bc"), ir.Const(0))
+    b3.stmts = [s_call3, s_clrw_ax, s_clrw_bc, ir.Ret(0x5008)]
+    f3.blocks[0x5000] = b3
+    fi3 = frame.FrameInfo(f3)
+
+    abi.analyze_calling_convention(f3, fi3)
+    assert s_call3.dst is None
+
+    print("ok  test_call_site_recovery_fallthrough_and_volatile")
+
+
 if __name__ == "__main__":
     test_param_inference_registers()
     test_param_inference_stack()
     test_return_inference()
     test_call_site_recovery()
+    test_call_site_recovery_fallthrough_and_volatile()
     print("\nall abi tests passed")

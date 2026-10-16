@@ -121,9 +121,145 @@ def test_vars_spill_bridging():
     print("ok  test_vars_spill_bridging")
 
 
+def test_vars_fold_call_return_to_stackvar():
+    # Models the main_listener() pattern:
+    # Block 0: c = call(0x35FB) -> fallthrough Block 1
+    # Block 1: a = c (dead volatile copy); result = c; cmp0(a) (dead compare); ret
+    f = cfg.Func(0x5000)
+    b0 = cfg.Block(0x5000)
+    b0.stmts = [
+        ir.Call(0x5000, target=0x35FB, dst=ir.Reg("c")),
+    ]
+    b0.succ = [("fall", 0x5004)]
+
+    res_var = ir.StackVar("result", width="b", offset=-2)
+    b1 = cfg.Block(0x5004)
+    b1.stmts = [
+        ir.Assign(0x5004, ir.Reg("a"), ir.Reg("c")),
+        ir.Assign(0x5005, res_var, ir.Reg("c")),
+        ir.Compare(0x5007, ir.FlagDef("cmp0", a=ir.Reg("a"), b=ir.Const(0))),
+        ir.Ret(0x5009),
+    ]
+    b1.succ = []
+
+    f.blocks[0x5000] = b0
+    f.blocks[0x5004] = b1
+    fi = frame.FrameInfo(f)
+
+    vars.recover_variables(f, None, fi)
+
+    assert b0.stmts[0].dst == res_var
+    # The redundant copy and dead compare in b1 should be eliminated
+    assert len(b1.stmts) == 1 and isinstance(b1.stmts[0], ir.Ret)
+    assert len(fi.virtual_vars) == 0
+    print("ok  test_vars_fold_call_return_to_stackvar")
+
+
+def test_vars_fold_call_return_with_subsequent_branch():
+    # Models: c = call(0x4FB8); a = c; result = c; if (c != 0) ...
+    # Should fold to: result = call(0x4FB8); if (result != 0) ...
+    f = cfg.Func(0x6000)
+    b0 = cfg.Block(0x6000)
+    b0.stmts = [
+        ir.Call(0x6000, target=0x4FB8, dst=ir.Reg("c")),
+    ]
+    b0.succ = [("fall", 0x6004)]
+
+    res_var = ir.StackVar("result", width="b", offset=-2)
+    fdef = ir.FlagDef("cmp0", a=ir.Reg("c"), b=ir.Const(0))
+    br = ir.Branch(0x6008, "nz", 0x6010, 0x600A)
+    br.flag = fdef
+
+    b1 = cfg.Block(0x6004)
+    b1.stmts = [
+        ir.Assign(0x6004, ir.Reg("a"), ir.Reg("c")),
+        ir.Assign(0x6005, res_var, ir.Reg("c")),
+        ir.Compare(0x6007, fdef),
+        br,
+    ]
+    b1.succ = [("cond", 0x6010), ("fall", 0x600A)]
+
+    b2 = cfg.Block(0x600A)
+    b2.stmts = [ir.Ret(0x600A)]
+    b3 = cfg.Block(0x6010)
+    b3.stmts = [ir.Ret(0x6010)]
+
+    f.blocks[0x6000] = b0
+    f.blocks[0x6004] = b1
+    f.blocks[0x600A] = b2
+    f.blocks[0x6010] = b3
+    fi = frame.FrameInfo(f)
+
+    vars.recover_variables(f, None, fi)
+
+    assert b0.stmts[0].dst == res_var
+    assert br.flag.a == res_var
+    assert len(fi.virtual_vars) == 0
+    print("ok  test_vars_fold_call_return_with_subsequent_branch")
+
+
+def test_vars_preserve_subregister_pair_writes():
+    # Models _start0: x = mem8[0xFD505]; a = 0; mem16[0xFE36E] = ax;
+    # Must NOT fold a = 0 alone into mem16[0xFE36E] = 0.
+    f = cfg.Func(0x7000)
+    b = cfg.Block(0x7000)
+    b.stmts = [
+        ir.Assign(0x7000, ir.Reg("x"), ir.Mem(ir.Const(0xFD505, "a"), width="b")),
+        ir.Assign(0x7004, ir.Reg("a"), ir.Const(0, "b")),
+        ir.Assign(0x7006, ir.Mem(ir.Const(0xFE36E, "a"), width="w"), ir.Reg("ax")),
+        ir.Ret(0x700A),
+    ]
+    f.blocks[0x7000] = b
+    fi = frame.FrameInfo(f)
+
+    vars.recover_variables(f, None, fi)
+
+    # All 3 assignments must remain, using the unified 16-bit virtual variable
+    assigns = [s for s in b.stmts if isinstance(s, ir.Assign)]
+    assert len(assigns) == 3
+    assert isinstance(assigns[2].src, ir.Var)
+    print("ok  test_vars_preserve_subregister_pair_writes")
+
+
+def test_vars_byte_shift_disjoint_webs():
+    # Models sub_4FB8:
+    # ax = var_s0 >> 5; var_2 = ax; a = var_s0 & 0x1F; ax = ax >> 8; var_4 = ax;
+    # Because ax >> 8 only reads atom 'a', var_2 = var_s0 >> 5 and var_4 = (var_s0 & 0x1F) >> 8
+    # must fold cleanly without merging via dead atom 'x'.
+    f = cfg.Func(0x8000)
+    b = cfg.Block(0x8000)
+    var_s0 = ir.StackVar("var_s0", width="w", offset=0)
+    var_2 = ir.StackVar("var_2", width="w", offset=-2)
+    var_4 = ir.StackVar("var_4", width="w", offset=-4)
+    b.stmts = [
+        ir.Assign(0x8000, ir.Reg("ax"), ir.Bin(">>", var_s0, ir.Const(5, "b"))),
+        ir.Assign(0x8003, var_2, ir.Reg("ax")),
+        ir.Assign(0x8006, ir.Reg("a"), ir.Bin("&", var_s0, ir.Const(0x1F, "b")),
+                  flag=ir.FlagDef("result", a=ir.Reg("a"))),
+        ir.Assign(0x8009, ir.Reg("ax"), ir.Bin(">>", ir.Reg("ax"), ir.Const(8, "b"))),
+        ir.Assign(0x800C, var_4, ir.Reg("ax")),
+        ir.Ret(0x800F),
+    ]
+    f.blocks[0x8000] = b
+    fi = frame.FrameInfo(f)
+
+    vars.recover_variables(f, None, fi)
+
+    assigns = [s for s in b.stmts if isinstance(s, ir.Assign)]
+    assert len(assigns) == 2
+    assert assigns[0].dst == var_2 and assigns[0].src == ir.Bin(">>", var_s0, ir.Const(5, "b"))
+    assert assigns[1].dst == var_4 and assigns[1].src == ir.Bin(">>", ir.Bin("&", var_s0, ir.Const(0x1F, "b")), ir.Const(8, "b"))
+    assert len(fi.virtual_vars) == 0
+    print("ok  test_vars_byte_shift_disjoint_webs")
+
+
 if __name__ == "__main__":
     test_vars_loop_induction()
     test_vars_disjoint_register_reuse()
     test_vars_param_binding()
     test_vars_spill_bridging()
+    test_vars_fold_call_return_to_stackvar()
+    test_vars_fold_call_return_with_subsequent_branch()
+    test_vars_preserve_subregister_pair_writes()
+    test_vars_byte_shift_disjoint_webs()
     print("All vars tests passed.")
