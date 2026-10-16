@@ -29,6 +29,12 @@ class Const(Expr):
         else:
             self.value = value & 0xFF
 
+    def __eq__(self, o):
+        return isinstance(o, Const) and o.value == self.value and o.width == self.width
+
+    def __hash__(self):
+        return hash(("const", self.value, self.width))
+
 
 class Reg(Expr):
     __slots__ = ("name", "width")
@@ -86,6 +92,18 @@ class Mem(Expr):
         self.es = es
         self.name = name
 
+    def __eq__(self, o):
+        return (
+            isinstance(o, Mem) and
+            o.addr == self.addr and
+            o.width == self.width and
+            o.es == self.es and
+            o.name == self.name
+        )
+
+    def __hash__(self):
+        return hash(("mem", self.addr, self.width, self.es, self.name))
+
 
 class Bit(Expr):
     """A single bit of a byte location (base is a Reg or Mem)."""
@@ -94,6 +112,12 @@ class Bit(Expr):
     def __init__(self, base, bit):
         self.base = base
         self.bit = bit
+
+    def __eq__(self, o):
+        return isinstance(o, Bit) and o.base == self.base and o.bit == self.bit
+
+    def __hash__(self):
+        return hash(("bit", self.base, self.bit))
 
 
 class Bin(Expr):
@@ -104,6 +128,12 @@ class Bin(Expr):
         self.l = l
         self.r = r
 
+    def __eq__(self, o):
+        return isinstance(o, Bin) and o.op == self.op and o.l == self.l and o.r == self.r
+
+    def __hash__(self):
+        return hash(("bin", self.op, self.l, self.r))
+
 
 class Un(Expr):
     __slots__ = ("op", "e")
@@ -112,6 +142,12 @@ class Un(Expr):
         self.op = op
         self.e = e
 
+    def __eq__(self, o):
+        return isinstance(o, Un) and o.op == self.op and o.e == self.e
+
+    def __hash__(self):
+        return hash(("un", self.op, self.e))
+
 
 class IntrExpr(Expr):
     __slots__ = ("name", "args")
@@ -119,6 +155,12 @@ class IntrExpr(Expr):
     def __init__(self, name, args):
         self.name = name
         self.args = args
+
+    def __eq__(self, o):
+        return isinstance(o, IntrExpr) and o.name == self.name and o.args == self.args
+
+    def __hash__(self):
+        return hash(("intrexpr", self.name, tuple(self.args)))
 
 
 # ---------------------------------------------------------------------------
