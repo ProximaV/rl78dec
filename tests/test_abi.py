@@ -350,6 +350,22 @@ def test_dword_return_inference():
     assert sig2.ret_type == "uint32_t"
     assert isinstance(sig2.ret_expr, ir.Const)
     assert sig2.ret_expr.value == 0
+
+    # Test function using DE for memory addressing before a store and returning 16-bit BC = 0 (e.g. init_s1_to_s3_8)
+    f3 = cfg.Func(0x4D01)
+    b3 = cfg.Block(0x4D01)
+    b3.stmts = [
+        ir.Assign(0x4D0A, ir.Reg("de"), ir.Const(0xE36C, width="w")),
+        ir.Assign(0x4D1C, ir.Mem(ir.Const(0xFE36C, width="a"), width="w"), ir.Reg("ax")),
+        ir.Assign(0x4D20, ir.Reg("bc"), ir.Const(0, width="w")),
+        ir.Ret(0x4D21),
+    ]
+    f3.blocks[0x4D01] = b3
+    fi3 = frame.analyze_frame(f3)
+    sig3 = abi.analyze_calling_convention(f3, fi3)
+    assert sig3.ret_type == "uint16_t"
+    assert isinstance(sig3.ret_expr, ir.Const)
+    assert sig3.ret_expr.value == 0
     print("ok  test_dword_return_inference")
 
 

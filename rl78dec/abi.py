@@ -187,33 +187,68 @@ def callee_returns_dword(callee_target):
         pfn = ida_funcs.get_func(callee_target)
         if pfn:
             insn = ida_ua.insn_t()
+            ret_count = 0
+            dword_ret_count = 0
             for ea in idautils.Heads(pfn.start_ea, pfn.end_ea):
                 if ida_ua.decode_insn(insn, ea) == 0:
                     continue
                 if insn.get_canon_mnem().upper() == "RET":
+                    ret_count += 1
                     has_bc = False
                     has_de = False
+                    popped_regs = set()
+                    consumed_regs = set()
                     prev_ea = ea
-                    for _ in range(4):
+                    for _ in range(8):
                         prev_ea = ida_bytes.prev_head(prev_ea, pfn.start_ea)
                         if prev_ea == ida_idaapi.BADADDR:
                             break
-                        if ida_ua.decode_insn(insn, prev_ea) != 0:
-                            mnem = insn.get_canon_mnem().upper()
-                            if mnem in ("MOVW", "XCHW", "CLRW", "ONEW", "MOV"):
-                                for op_idx in range(2):
-                                    op = insn.ops[op_idx]
-                                    if op.type == ida_ua.o_reg:
-                                        rname = ida_idp.get_reg_name(op.reg, op.dtype).upper()
-                                        if rname in ("BC", "C", "B"):
-                                            has_bc = True
-                                        if rname in ("DE", "E", "D"):
-                                            has_de = True
-                            elif mnem in ("CALL", "RET", "RETI", "BR"):
+                        if ida_ua.decode_insn(insn, prev_ea) == 0:
+                            break
+                        mnem = insn.get_canon_mnem().upper()
+                        if mnem == "POP" and insn.ops[0].type == ida_ua.o_reg:
+                            rname = ida_idp.get_reg_name(insn.ops[0].reg, insn.ops[0].dtype).upper()
+                            if rname in ("BC", "C", "B"):
+                                popped_regs.add("BC")
+                            elif rname in ("DE", "E", "D"):
+                                popped_regs.add("DE")
+                            continue
+                        if mnem in (
+                            "CALL", "CALLT", "RET", "RETI", "RETB", "BR",
+                            "BZ", "BNZ", "BC", "BNC", "BH", "BNH", "BT", "BF", "BTCLR",
+                            "SKC", "SKNC", "SKZ", "SKNZ", "SKH", "SKNH",
+                            "CMP", "CMPW", "CMP0", "CMPS",
+                        ):
+                            break
+                        if mnem in ("MOVW", "MOV", "CLRW", "ONEW", "CLRB", "ONEB"):
+                            op0 = insn.ops[0]
+                            if op0.type != ida_ua.o_reg:
                                 break
+                            rname = ida_idp.get_reg_name(op0.reg, op0.dtype).upper()
+                            if rname in ("BC", "C", "B") and "BC" not in popped_regs and "BC" not in consumed_regs:
+                                has_bc = True
+                            elif rname in ("DE", "E", "D") and "DE" not in popped_regs and "DE" not in consumed_regs:
+                                has_de = True
+                            op1 = insn.ops[1]
+                            if op1.type == ida_ua.o_reg:
+                                srname = ida_idp.get_reg_name(op1.reg, op1.dtype).upper()
+                                if srname in ("BC", "C", "B"):
+                                    consumed_regs.add("BC")
+                                elif srname in ("DE", "E", "D"):
+                                    consumed_regs.add("DE")
+                        elif mnem in ("XCHW", "XCH"):
+                            for op_idx in range(2):
+                                op = insn.ops[op_idx]
+                                if op.type == ida_ua.o_reg:
+                                    rname = ida_idp.get_reg_name(op.reg, op.dtype).upper()
+                                    if rname in ("BC", "C", "B") and "BC" not in popped_regs:
+                                        has_bc = True
+                                    elif rname in ("DE", "E", "D") and "DE" not in popped_regs:
+                                        has_de = True
                     if has_bc and has_de:
-                        res = True
-                        break
+                        dword_ret_count += 1
+            if ret_count > 0 and dword_ret_count == ret_count:
+                res = True
     except Exception:
         pass
     _callee_returns_dword_cache[callee_target] = res
@@ -298,12 +333,12 @@ def _consolidate_pair(a_off, a_seg):
     off_val = a_off.value if isinstance(a_off, ir.Const) else None
     seg_val = a_seg.value if isinstance(a_seg, ir.Const) else None
     if off_val is not None and seg_val is not None:
-        linear = ((seg_val & 0xFF) << 16) | (off_val & 0xFFFF)
+        linear = ((seg_val & 0xFFFF) << 16) | (off_val & 0xFFFF)
         return ir.Const(linear, width="d")
     if seg_val is not None:
         if seg_val == 0:
             return a_off
-        return ir.Bin("|", ir.Const((seg_val & 0xFF) << 16, width="d"), a_off)
+        return ir.Bin("|", ir.Const((seg_val & 0xFFFF) << 16, width="d"), a_off)
     return ir.Bin("|", ir.Bin("<<", a_seg, ir.Const(16, width="b")), a_off)
 
 
@@ -400,6 +435,64 @@ def _compute_liveness(func, hidden_stmts):
     return live_in.get(func.entry, set())
 
 
+def _collect_expr_used_atoms(e, out):
+    if isinstance(e, ir.Reg):
+        out.update(regs.atoms(e.name))
+    elif isinstance(e, ir.Bin):
+        _collect_expr_used_atoms(e.l, out)
+        _collect_expr_used_atoms(e.r, out)
+    elif isinstance(e, ir.Un):
+        _collect_expr_used_atoms(e.e, out)
+    elif isinstance(e, ir.Bit):
+        _collect_expr_used_atoms(e.base, out)
+    elif isinstance(e, ir.IntrExpr):
+        for a in e.args:
+            _collect_expr_used_atoms(a, out)
+    elif isinstance(e, ir.Mem) and isinstance(e.addr, ir.Expr):
+        _collect_expr_used_atoms(e.addr, out)
+
+
+def _get_block_last_read_ea(b):
+    """Map each register atom to the last instruction EA in b.insns where it is read without being written."""
+    last_read = {}
+    for ins in getattr(b, "insns", ()):
+        if ins.mnem in ("ret", "reti", "retb", "xch", "xchw", "pop"):
+            continue
+        written_atoms = set()
+        if ins.ops and ins.ops[0].mode == "reg" and ins.mnem not in (
+            "cmp", "cmpw", "cmps", "cmp0", "push", "call", "callt", "br", "bt", "bf", "btclr"
+        ):
+            if ins.ops[0].reg:
+                written_atoms.update(regs.atoms(ins.ops[0].reg))
+        if ins.mnem == "mulu":
+            written_atoms.update(("a", "x"))
+
+        read_atoms = set()
+        for idx, op in enumerate(ins.ops):
+            if op.mode in ("ind", "idx16", "hloff") and op.base_reg:
+                read_atoms.update(regs.atoms(op.base_reg))
+                if op.mode == "hloff":
+                    read_atoms.update(("h", "l"))
+            elif op.mode == "bit":
+                if op.base == "ind" and op.base_reg:
+                    read_atoms.update(regs.atoms(op.base_reg))
+                elif op.base == "reg" and op.reg and ins.mnem not in ("set1", "clr1"):
+                    read_atoms.update(regs.atoms(op.reg))
+            elif op.mode == "reg" and op.reg:
+                if idx > 0 or ins.mnem in (
+                    "cmp", "cmpw", "cmps", "cmp0", "push",
+                    "add", "addc", "sub", "subc", "and", "or", "xor",
+                    "addw", "subw", "inc", "incw", "dec", "decw",
+                    "shl", "shr", "sar", "shlw", "shrw", "sarw",
+                    "rol", "ror", "rolc", "rorc", "rolwc", "mulu",
+                ):
+                    read_atoms.update(regs.atoms(op.reg))
+
+        for a in read_atoms - written_atoms:
+            last_read[a] = ins.ea
+    return last_read
+
+
 def _infer_return(func, hidden_stmts):
     """Determine the function return type and return expression from exit blocks.
 
@@ -421,18 +514,38 @@ def _infer_return(func, hidden_stmts):
             cand_reg = None
 
             assigned = {}
+            popped_atoms = set()
+            consumed_atoms = set()
+            last_read_ea = _get_block_last_read_ea(b)
+
             for s in reversed(b.stmts[:-1]):
+                if isinstance(s, ir.Intrinsic) and s.name == "pop":
+                    if s.args and isinstance(s.args[0], ir.Reg):
+                        popped_atoms.update(regs.atoms(s.args[0].name))
+                    continue
                 if id(s) in hidden_stmts:
                     continue
-                if isinstance(s, ir.Assign) and isinstance(s.dst, ir.Reg):
-                    dname = s.dst.name
-                    if dname not in assigned:
-                        assigned[dname] = s.src
+                if isinstance(s, ir.Assign):
+                    if isinstance(s.dst, ir.Mem):
+                        break
+                    if isinstance(s.dst, ir.Reg):
+                        dname = s.dst.name
+                        datoms = set(regs.atoms(dname))
+                        s_ea = getattr(s, "ea", None)
+                        read_later = s_ea is not None and any(last_read_ea.get(a, -1) > s_ea for a in datoms)
+                        if not (datoms <= popped_atoms) and not (datoms <= consumed_atoms) and not read_later:
+                            if dname not in assigned:
+                                assigned[dname] = s.src
+                        _collect_expr_used_atoms(s.src, consumed_atoms)
+                    else:
+                        _collect_expr_used_atoms(s.src, consumed_atoms)
                 elif isinstance(s, ir.Swap):
                     for r in (s.a, s.b):
-                        if isinstance(r, ir.Reg) and r.name not in assigned:
-                            assigned[r.name] = r
-                elif isinstance(s, (ir.Call, ir.Branch, ir.Goto)):
+                        if isinstance(r, ir.Reg):
+                            datoms = set(regs.atoms(r.name))
+                            if not (datoms <= popped_atoms) and not (datoms <= consumed_atoms) and r.name not in assigned:
+                                assigned[r.name] = r
+                elif isinstance(s, (ir.Call, ir.Branch, ir.Goto, ir.Compare, ir.Intrinsic)):
                     break
 
             has_bc = "bc" in assigned or "c" in assigned
@@ -448,7 +561,11 @@ def _infer_return(func, hidden_stmts):
                 if isinstance(de_src, ir.Const) and isinstance(bc_src, ir.Const):
                     cand_expr = ir.Const(((de_src.value << 16) | bc_src.value) & 0xFFFFFFFF, width="d")
                 else:
-                    cand_expr = ir.Reg("de:bc", width="d")
+                    de_reg = ir.Reg("de" if "de" in assigned else "e")
+                    bc_reg = ir.Reg("bc" if "bc" in assigned else "c")
+                    de_part = de_src if isinstance(de_src, ir.Const) else de_reg
+                    bc_part = bc_src if isinstance(bc_src, ir.Const) else bc_reg
+                    cand_expr = _consolidate_pair(bc_part, de_part)
             elif "bc" in assigned:
                 cand_type = "uint16_t"
                 cand_reg = "bc"
