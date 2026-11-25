@@ -300,6 +300,10 @@ class _Emit:
                 return "%s = %s;" % (self.expr(s.dst), call_str)
             return "%s;" % call_str
         if isinstance(s, ir.Intrinsic):
+            if s.name == "brk":
+                if s.args and isinstance(s.args[0], ir.Const):
+                    return "brk();   /* swi -> %s */" % self.namer.code(s.args[0].value)
+                return "brk();   /* swi [0x007E] */"
             call = "%s(%s);" % (s.name, ", ".join(self.expr(a) for a in s.args))
             return call + ("   /* %s */" % s.note if s.note else "")
         return "/* %s */" % type(s).__name__
@@ -318,10 +322,12 @@ class _Emit:
                 self._pending.append((ind, pad + self.stmt(n.stmt), getattr(n.stmt, "ea", None)))
             elif isinstance(n, S.SRet):
                 ret_ea = getattr(n, "ea", None)
+                ret_kind = getattr(n, "kind", "ret")
+                suffix = ("   /* %s */" % ret_kind) if ret_kind in ("reti", "retb") else ""
                 if getattr(n, "val", None) is not None:
-                    self._pending.append((ind, pad + "return %s;" % self.expr(n.val), ret_ea))
+                    self._pending.append((ind, pad + "return %s;%s" % (self.expr(n.val), suffix), ret_ea))
                 else:
-                    self._pending.append((ind, pad + "return;", ret_ea))
+                    self._pending.append((ind, pad + "return;%s" % suffix, ret_ea))
 
             elif isinstance(n, S.SGoto):
                 if n.ea in self.block_starts:

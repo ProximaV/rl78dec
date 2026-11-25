@@ -17,7 +17,7 @@ class SLabel:
 class SGoto:
     def __init__(self, ea): self.ea = ea
 class SRet:
-    def __init__(self, val=None): self.val = val
+    def __init__(self, val=None, kind="ret"): self.val = val; self.kind = kind
 class SIf:
     def __init__(self, cond, then, els): self.cond = cond; self.then = then; self.els = els
 class SIfGoto:
@@ -106,6 +106,12 @@ class _Structurer:
                 return s.val
         return None
 
+    def _ret_kind(self, block):
+        for s in reversed(block.stmts):
+            if isinstance(s, ir.Ret):
+                return getattr(s, "kind", "ret")
+        return "ret"
+
     def _body_stmts(self, block):
         out = []
         for s in block.stmts:
@@ -148,7 +154,7 @@ class _Structurer:
                 c_body.extend(self._body_stmts(self.blocks[ti]))
                 t_term = self.blocks[ti].term
                 if t_term == "ret":
-                    c_body.append(SRet(self._ret_val(self.blocks[ti])))
+                    c_body.append(SRet(self._ret_val(self.blocks[ti]), self._ret_kind(self.blocks[ti])))
                 elif self.blocks[ti].succ:
                     s_tgt = self.blocks[ti].succ[0][1]
                     if s_tgt == follow_ea:
@@ -166,7 +172,7 @@ class _Structurer:
             default_body = self._body_stmts(self.blocks[di])
             t_term = self.blocks[di].term
             if t_term == "ret":
-                default_body.append(SRet(self._ret_val(self.blocks[di])))
+                default_body.append(SRet(self._ret_val(self.blocks[di]), self._ret_kind(self.blocks[di])))
             elif self.blocks[di].succ:
                 s_tgt = self.blocks[di].succ[0][1]
                 if s_tgt == follow_ea:
@@ -209,7 +215,7 @@ class _Structurer:
                         i += 1
                     continue
             if term == "ret":
-                ret_node = SRet(self._ret_val(b))
+                ret_node = SRet(self._ret_val(b), self._ret_kind(b))
                 ret_node.ea = b.stmts[-1].ea if b.stmts else b.start
                 out.append(ret_node)
                 i += 1

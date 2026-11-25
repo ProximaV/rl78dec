@@ -85,11 +85,11 @@ def get_callee_preserved_regs(callee_target):
                     if ida_ua.decode_insn(insn, ea) == 0:
                         continue
                     mnem = insn.get_canon_mnem().upper()
-                    if mnem == "RET":
+                    if mnem in ("RET", "RETI", "RETB"):
                         ret_count += 1
                         has_pop = False
                         prev_ea = ea
-                        for _ in range(2):
+                        for _ in range(5):
                             prev_ea = ida_bytes.prev_head(prev_ea, pfn.start_ea)
                             if prev_ea == ida_idaapi.BADADDR:
                                 break
@@ -163,7 +163,7 @@ def callee_expects_ax(callee_target):
             elif mnem in ("XCHW", "XCH"):
                 if is_reg(0, "AX", "A", "X") or is_reg(1, "AX", "A", "X"):
                     return True
-            elif mnem in ("CALL", "RET", "RETI", "BR"):
+            elif mnem in ("CALL", "CALLT", "RET", "RETI", "RETB", "BR", "BRK", "BRK1"):
                 break
 
             cur += insn.size
@@ -214,7 +214,7 @@ def callee_returns_dword(callee_target):
                                 popped_regs.add("DE")
                             continue
                         if mnem in (
-                            "CALL", "CALLT", "RET", "RETI", "RETB", "BR",
+                            "CALL", "CALLT", "RET", "RETI", "RETB", "BR", "BRK", "BRK1",
                             "BZ", "BNZ", "BC", "BNC", "BH", "BNH", "BT", "BF", "BTCLR",
                             "SKC", "SKNC", "SKZ", "SKNZ", "SKH", "SKNH",
                             "CMP", "CMPW", "CMP0", "CMPS",
@@ -509,6 +509,8 @@ def _infer_return(func, hidden_stmts):
     for b in func.blocks.values():
         if b.stmts and isinstance(b.stmts[-1], ir.Ret):
             ret_block_count += 1
+            if getattr(b.stmts[-1], "kind", "ret") in ("reti", "retb"):
+                continue
             cand_expr = None
             cand_type = "void"
             cand_reg = None

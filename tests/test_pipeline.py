@@ -283,6 +283,73 @@ def test_math_simplification():
     print("ok  test_math_simplification")
 
 
+def test_brk_and_callt_semantics():
+    buf = bytearray(0x300)
+    # 0x007E: BRK vector -> 0x0220
+    buf[0x7E] = 0x20
+    buf[0x7F] = 0x02
+    # 0x0080: CALLT[0x80] entry -> 0x0200
+    buf[0x80] = 0x00
+    buf[0x81] = 0x02
+
+    # 0x0100: onew ax (E6) ; callt [0x0080] (61 84) ; ret (D7)
+    buf[0x100:0x104] = bytes([0xE6, 0x61, 0x84, 0xD7])
+    # 0x0200 (CALLT target): incw ax (A1) ; ret (D7)
+    buf[0x200:0x202] = bytes([0xA1, 0xD7])
+
+    # 0x0120: mov a, #5 (51 05) ; brk (61 CC) ; onew bc (E7) ; ret (D7)
+    buf[0x120:0x126] = bytes([0x51, 0x05, 0x61, 0xCC, 0xE7, 0xD7])
+    # 0x0220 (BRK handler): push ax (C1) ; mov a, #1 (51 01) ; pop ax (C0) ; retb (61 EC)
+    buf[0x220:0x226] = bytes([0xC1, 0x51, 0x01, 0xC0, 0x61, 0xEC])
+
+    # 0x0140: mov a, #1 (51 01) ; brk1 (FF) ; mov a, #2 (51 02) ; ret (D7)
+    buf[0x140:0x146] = bytes([0x51, 0x01, 0xFF, 0x51, 0x02, 0xD7])
+
+    # 0x0160: callt [0x0082] (61 94, unpopulated slot -> fallback indirect) ; ret (D7)
+    buf[0x160:0x163] = bytes([0x61, 0x94, 0xD7])
+
+    insns, calls = decoder.decode(buf, entries=[0x100, 0x120, 0x140, 0x160], base=0)
+
+    # 1. CALLT resolves vector table [0x80] -> 0x200 and discovers callee
+    assert insns[0x101].mnem == "callt"
+    assert insns[0x101].ops[0].addr == 0x80
+    assert insns[0x101].ops[0].value == 0x200
+    assert decoder.target_of(insns[0x101]) == 0x200
+    assert 0x200 in calls and 0x200 in insns
+
+    # 2. BRK resolves vector [0x7E] -> 0x220 AND falls through to 0x124 (PC + 2)
+    assert insns[0x122].mnem == "brk"
+    assert decoder.target_of(insns[0x122]) == 0x220
+    assert 0x220 in calls and 0x220 in insns
+    assert 0x124 in insns and insns[0x124].mnem == "onew"
+
+    # 3. BRK1 (0xFF) stops decoding and does NOT fall through to 0x143
+    assert insns[0x142].mnem == "brk1"
+    assert 0x143 not in insns
+
+    # 4. End-to-end decompilation checks
+    prog = decompile_image(buf, entries=[0x100, 0x120, 0x160], code_names={0x200: "ct_helper", 0x220: "swi_handler"})
+
+    t_callt = "\n".join(prog.funcs[0x100].lines)
+    assert "ct_helper(1);" in t_callt, t_callt
+    assert "m_00080" not in t_callt, t_callt
+    assert 0x200 in prog.funcs[0x100].cfg.calls
+
+    t_brk = "\n".join(prog.funcs[0x120].lines)
+    assert "brk();   /* swi -> swi_handler */" in t_brk, t_brk
+    assert "return 1;" in t_brk, t_brk
+    assert 0x220 in prog.funcs[0x120].cfg.calls
+
+    t_swi = "\n".join(prog.funcs[0x220].lines)
+    assert "void swi_handler(void)" in t_swi, t_swi
+    assert "return;   /* retb */" in t_swi, t_swi
+
+    t_unres = "\n".join(prog.funcs[0x160].lines)
+    assert "(*m_00082)();" in t_unres, t_unres
+
+    print("ok  test_brk_and_callt_semantics")
+
+
 if __name__ == "__main__":
     test_decode_fields()
     test_all_first_bytes()
@@ -293,4 +360,5 @@ if __name__ == "__main__":
     test_named_variable_constant()
     test_struct_pointer_cascading()
     test_math_simplification()
+    test_brk_and_callt_semantics()
     print("\nall tests passed")

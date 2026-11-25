@@ -88,8 +88,15 @@ FLAG_FX = {
 SETS_Z = frozenset(m for m, (z, _) in FLAG_FX.items() if z == "def")
 SETS_CY = frozenset(m for m, (_, cy) in FLAG_FX.items() if cy is not None)
 
-# instructions that end a basic block (unconditional flow / return)
-STOP = frozenset(("br", "ret", "reti", "retb", "brk", "stop"))
+# Vector table addresses in code flash (segment 0)
+BRK_VECTOR = 0x007E
+CALLT_TABLE_START = 0x0080
+CALLT_TABLE_END = 0x00C0
+
+# instructions that end a basic block without falling through (unconditional flow / return / trap)
+# Note: BRK (61 CC) is a software interrupt to [0x007E] that returns via RETB to PC+2,
+# whereas BRK1 (0xFF) is a hardware/unprogrammed-flash trap that does not return.
+STOP = frozenset(("br", "ret", "reti", "retb", "brk1", "stop"))
 RET = frozenset(("ret", "reti", "retb"))
 # conditional PC-relative branches: mnemonic -> flag-condition token
 COND_BRANCH = {

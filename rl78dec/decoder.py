@@ -44,7 +44,7 @@ class Operand:
 
 
 class Insn:
-    __slots__ = ("ea", "size", "mnem", "ops", "es", "raw", "switch")
+    __slots__ = ("ea", "size", "mnem", "ops", "es", "raw", "switch", "vector_target")
 
     def __init__(self, ea):
         self.ea = ea
@@ -54,6 +54,7 @@ class Insn:
         self.es = False
         self.raw = b""
         self.switch = None
+        self.vector_target = None
 
     def op(self, i):
         return self.ops[i] if i < len(self.ops) else None
@@ -180,8 +181,17 @@ class _Dec:
         addr |= self.u8() << 16
         self.add(Operand("far", addr=addr))
 
+    def _read_vector16(self, vec_addr):
+        off = vec_addr - self.base
+        if 0 <= off and off + 1 < len(self.image):
+            tgt = self.image[off] | (self.image[off + 1] << 8)
+            if 0 < tgt < 0x10000 and tgt != 0xFFFF:
+                return tgt
+        return None
+
     def callt(self, addr):
-        self.add(Operand("callt", addr=addr, width="w"))
+        tgt = self._read_vector16(addr)
+        self.add(Operand("callt", addr=addr, value=tgt or 0, width="w"))
 
     @staticmethod
     def _convert(op):
@@ -291,7 +301,7 @@ def _map61(d):
         0xDB: ("ror", lambda: (d.reg("a"), d.imm_val(1))),
         0xEB: ("rol", lambda: (d.reg("a"), d.imm_val(1))),
         0xFB: ("rorc", lambda: (d.reg("a"), d.imm_val(1))),
-        0xCC: ("brk", None),
+        0xCC: ("brk", lambda: setattr(d.ins, "vector_target", d._read_vector16(isa.BRK_VECTOR))),
         0xDC: ("rolc", lambda: (d.reg("a"), d.imm_val(1))),
         0xEC: ("retb", None), 0xFC: ("reti", None),
         0xCD: ("pop", lambda: d.reg("psw")),
@@ -611,7 +621,13 @@ def decode_one(image, ea, base=0):
 
 
 def target_of(ins):
-    """Static code target of a branch/call, or None."""
+    """Static code target of a branch/call/callt/brk, or None."""
+    if ins.mnem == "callt":
+        if ins.ops and ins.ops[0].mode == "callt" and ins.ops[0].value:
+            return ins.ops[0].value
+        return None
+    if ins.mnem == "brk":
+        return getattr(ins, "vector_target", None)
     if not ins.ops:
         return None
     op = ins.ops[-1] if ins.mnem in ("bt", "bf", "btclr") else ins.ops[0]
@@ -636,13 +652,13 @@ def _succ(ins, image=None, base=0):
     if m == "br":
         if tgt is not None:
             out.append(("jump", tgt))
-    elif m in isa.RET or m in ("brk", "stop"):
+    elif m in isa.RET or m in ("brk1", "stop"):
         pass
     elif m in isa.COND_BRANCH or m in isa.BIT_BRANCH:
         if tgt is not None:
             out.append(("jump", tgt))
         out.append(("fall", ins.ea + ins.size))
-    elif m == "call":
+    elif m in ("call", "callt", "brk"):
         if tgt is not None:
             out.append(("call", tgt))
         out.append(("fall", ins.ea + ins.size))

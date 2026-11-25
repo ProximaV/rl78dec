@@ -55,7 +55,7 @@ def _succ(insns, ins):
     if m == "br":
         t = target_of(ins)
         return [("jump", t)] if t is not None else []
-    if m in isa.RET or m == "stop":
+    if m in isa.RET or m in ("stop", "brk1"):
         return []
     if m in isa.COND_BRANCH or m in isa.BIT_BRANCH:
         t = target_of(ins)
@@ -88,7 +88,7 @@ def _leaders(insns, body):
                 leaders.add(tgt)
         # instruction after any control transfer starts a block
         if ins.mnem in isa.COND_BRANCH or ins.mnem in isa.BIT_BRANCH \
-                or ins.mnem in isa.SKIP or ins.mnem == "call" or ins.mnem == "callt" \
+                or ins.mnem in isa.SKIP or ins.mnem in ("call", "callt", "brk") \
                 or ins.mnem in isa.STOP or ins.mnem in isa.RET \
                 or getattr(ins, "switch", None) is not None:
             nxt = ea + ins.size
@@ -130,7 +130,7 @@ def build_func(insns, entry, entry_set):
             term = ("goto", succ)
         elif ins.mnem == "br":
             term = ("ret", [])                       # indirect br: ends block
-        elif ins.mnem in isa.RET or ins.mnem == "stop":
+        elif ins.mnem in isa.RET or ins.mnem in ("stop", "brk1"):
             term = ("ret", [])
         elif ins.mnem in isa.SKIP or ins.mnem in isa.COND_BRANCH or ins.mnem in isa.BIT_BRANCH:
             term = ("branch", succ)
@@ -151,7 +151,7 @@ def build_func(insns, entry, entry_set):
                     b.stmts.append(ir.Switch(ins.ea, ins.switch.expr, ins.switch.cases,
                                              default=ins.switch.default_ea, table_ea=ins.switch.table_ea))
                 continue
-            if ins.mnem == "call" and target_of(ins) is not None:
+            if ins.mnem in ("call", "callt", "brk") and target_of(ins) is not None:
                 f.calls.add(target_of(ins))
             if getattr(ins, "switch", None) is not None:
                 b.stmts.append(ir.Switch(ins.ea, ins.switch.expr, ins.switch.cases,

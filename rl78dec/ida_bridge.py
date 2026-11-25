@@ -147,7 +147,7 @@ def _get_caller_consensus(entry):
                         found_ax = True
                     if not found_bc and rname in ("BC", "B", "C"):
                         found_bc = True
-                if mnem in ("CALL", "RET", "RETI", "BR"):
+                if mnem in ("CALL", "CALLT", "RET", "RETI", "RETB", "BR", "BRK", "BRK1"):
                     break
                 cur = ida_bytes.prev_head(cur, 0)
             valid += 1

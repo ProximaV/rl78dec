@@ -35,6 +35,7 @@ class FrameInfo:
         self.hidden_stmts = set()    # set of id(stmt) to suppress in code generation
         self.prologue_stmts = []
         self.epilogue_stmts = []
+        self.is_isr = False          # True when function exits via reti/retb
 
     def describe(self):
         parts = []
@@ -48,13 +49,13 @@ class FrameInfo:
 def _is_push_reg(s):
     return (isinstance(s, ir.Intrinsic) and s.name == "push" and
             bool(s.args) and isinstance(s.args[0], ir.Reg) and
-            s.args[0].name in ("hl", "de", "bc", "ax"))
+            s.args[0].name in ("hl", "de", "bc", "ax", "psw"))
 
 
 def _is_pop_reg(s):
     return (isinstance(s, ir.Intrinsic) and s.name == "pop" and
             bool(s.args) and isinstance(s.args[0], ir.Reg) and
-            s.args[0].name in ("hl", "de", "bc", "ax"))
+            s.args[0].name in ("hl", "de", "bc", "ax", "psw"))
 
 
 def _is_sub_sp(s):
@@ -255,9 +256,14 @@ def analyze_frame(func, ida_frame_info=None):
     total_pushed_bytes = len(info.saved_regs) * 2
     arg_base = info.frame_size + total_pushed_bytes + 4
 
+    ret_kinds = {s.kind for b in func.blocks.values() for s in b.stmts if isinstance(s, ir.Ret)}
+    info.is_isr = bool(ret_kinds) and ret_kinds <= {"reti", "retb"}
+
     for i, r in enumerate(info.saved_regs):
         disp = info.frame_size + (len(info.saved_regs) - 1 - i) * 2
-        if r in ("hl", "de"):
+        if r in ("hl", "de", "psw"):
+            true_saved.append(r)
+        elif info.is_isr and r in ("ax", "bc") and r in popped_regs:
             true_saved.append(r)
         elif r == "ax":
             if _is_disp_read_before_write(func, info.fp_reg, disp):

@@ -161,6 +161,9 @@ def lift_insn(ins):
             return [ir.Call(ea, target=tgt.addr)]
         return [ir.Call(ea, expr=e(0))]
     if m == "callt":
+        tgt = ops[0].value
+        if tgt:
+            return [ir.Call(ea, target=tgt)]
         return [ir.Call(ea, expr=ir.Mem(ops[0].addr, "w"))]
     if m in ("ret", "reti", "retb"):
         return [ir.Ret(ea, m)]
@@ -170,7 +173,12 @@ def lift_insn(ins):
         return [ir.Intrinsic(ea, m, [e(0)])]
     if m == "sel":
         return [ir.Intrinsic(ea, "sel", [e(0)])]
-    if m in ("ei", "di", "halt", "stop", "brk", "brk1", "nop"):
+    if m == "brk":
+        vtgt = getattr(ins, "vector_target", None)
+        if vtgt:
+            return [ir.Intrinsic(ea, "brk", [ir.Const(vtgt, "a")], note="swi [0x007E]")]
+        return [ir.Intrinsic(ea, "brk", [], note="swi [0x007E]")]
+    if m in ("ei", "di", "halt", "stop", "brk1", "nop"):
         if m == "nop":
             return [ir.Nop(ea)]
         return [ir.Intrinsic(ea, m, [])]
