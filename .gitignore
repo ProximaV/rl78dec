@@ -13,8 +13,7 @@ __pycache__/
 *.pyc
 *.pyo
 *.c
-!ctests/**/*.c
-!legacy_py/tests/**/*.c
+!tests/**/*.c
 build/
 dist/
 *.egg-info/

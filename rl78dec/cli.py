@@ -1,8 +1,5 @@
 """
-DEPRECATED: Legacy pure-Python CLI front end (archived in legacy_py/).
-Use the native C++17 `rl78dec_cli` binary instead.
-
-Legacy command-line usage:
+Headless command-line front end:
 
     python -m rl78dec syscon.bin
     python -m rl78dec syscon.bin -o syscon.c
@@ -14,7 +11,6 @@ No IDA required.  Accepts a raw flash dump or a Sony FUPD container.
 
 import argparse
 import sys
-import warnings
 
 from . import decompile_file
 
@@ -24,15 +20,6 @@ def _int(s):
 
 
 def main(argv=None):
-    warnings.warn(
-        "The legacy Python rl78dec CLI is deprecated and unmaintained; use native rl78dec_cli instead.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    print(
-        "[DEPRECATED] legacy Python rl78dec CLI is deprecated; use native rl78dec_cli instead.",
-        file=sys.stderr,
-    )
     argv = argv if argv is not None else sys.argv[1:]
     ap = argparse.ArgumentParser(prog="rl78dec",
                                  description="Decompile RL78 (PS4/Vita syscon) firmware to pseudo-C.")

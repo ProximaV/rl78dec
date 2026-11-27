@@ -1,7 +1,5 @@
 """
-DEPRECATED: Legacy pure-Python IDA plugin entry point (archived in legacy_py/).
-Use the native C++17 `rl78dec.dll` + `rl78dec_hexrays_bridge.py` deployed via
-`cmake --build build --target rl78dec_deploy` instead.
+IDA plugin entry point for rl78dec, the RL78 (PS4/Vita syscon) decompiler.
 
 Install by copying this file *and* the ``rl78dec`` package directory together
 into IDA's user plugin directory:
@@ -21,14 +19,6 @@ import os
 import sys
 import time
 import traceback
-import warnings
-
-warnings.warn(
-    "legacy_py/rl78dec_plugin.py is deprecated and unmaintained. "
-    "Remove it and deploy native rl78dec.dll via 'cmake --build build --target rl78dec_deploy'.",
-    DeprecationWarning,
-    stacklevel=2,
-)
 
 try:
     import ida_idaapi
@@ -226,11 +216,6 @@ class Rl78DecPlugin(ida_idaapi.plugin_t if ida_idaapi else object):
 
         print("rl78dec: loaded -- %s = this function, %s = decompile all"
               % (HOTKEY_DECOMPILE, HOTKEY_ALL))
-        print(
-            "[DEPRECATED] Pure-Python rl78dec_plugin.py is deprecated and unmaintained. "
-            "Delete rl78dec_plugin.py from %APPDATA%\\Hex-Rays\\IDA Pro\\plugins\\ and deploy "
-            "native rl78dec.dll + rl78dec_hexrays_bridge.py via 'cmake --build build --target rl78dec_deploy'."
-        )
         try:
             from rl78dec import view
             view.init_hooks()
