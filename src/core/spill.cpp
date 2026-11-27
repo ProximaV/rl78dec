@@ -136,7 +136,7 @@ void eliminate_spills(Function &func, FrameInfo &frame_info) {
 
     // Pass 2: Simulate remaining pushes/pops as virtual spill variables (_sN)
     std::unordered_map<uint32_t, std::vector<ExprPtr>> in_stack;
-    in_stack[func.entry] = {};
+    in_stack[func.entry] = frame_info.initial_spill_stack;
     int spill_cnt = 0;
 
     auto order = func.ordered();
@@ -172,7 +172,12 @@ void eliminate_spills(Function &func, FrameInfo &frame_info) {
                     stk.pop_back();
                     new_stmts.push_back(make_assign(s->ea, s->args[0], var));
                 } else {
-                    new_stmts.push_back(s);
+                    ExprPtr mem_sp = Expr::make_mem_addr(Expr::make_reg("sp"), s->args[0]->width);
+                    new_stmts.push_back(make_assign(s->ea, s->args[0], mem_sp));
+                    new_stmts.push_back(make_assign(
+                        s->ea,
+                        Expr::make_reg("sp"),
+                        Expr::make_bin("+", Expr::make_reg("sp"), Expr::make_const(2, Width::W), Width::W)));
                 }
             } else {
                 int add_val = 0;

@@ -2486,6 +2486,512 @@ void test_multi_block_es_0f_with_const_hl() {
     pass_msg(kTestName);
 }
 
+void test_process_conf_shared_epilogue_returns_and_no_flag_noise() {
+    const std::string kTestName = "test_process_conf_shared_epilogue_returns_and_no_flag_noise";
+
+    // Part A: Exact real DOL-1001-VTE-1001-00703030.i64 `process_CONF` (0xA714..0xA863) machine bytes
+    // + `sub_3444C` (0x3444C) + `sub_225B` (0x225B) + `sub_21A2` (0x21A2)
+    {
+        const std::vector<uint8_t> conf_bytes = {
+            0xC7, 0xC1, 0x20, 0x12, 0xFB, 0xF8, 0xFF, 0xC7, 0x17, 0x04, 0x0E, 0x00, 0x16, 0xF7, 0x41, 0x00,
+            0x11, 0x49, 0x6E, 0x32, 0x9B, 0xA3, 0xA7, 0x51, 0x04, 0x61, 0x4A, 0xDF, 0xF3, 0xC6, 0xF6, 0xBC,
+            0x06, 0xBC, 0x08, 0x8C, 0x12, 0x4C, 0x02, 0xDC, 0x04, 0xE7, 0xEE, 0x1E, 0x01, 0x8C, 0x12, 0x31,
+            0x29, 0xF0, 0x41, 0x00, 0x11, 0x02, 0x6A, 0x32, 0xC1, 0x11, 0x8F, 0x6C, 0x32, 0x9D, 0xD4, 0xC0,
+            0xBC, 0x0A, 0x8D, 0xD4, 0x9C, 0x0C, 0x30, 0x04, 0x00, 0xC1, 0x17, 0x04, 0x0E, 0x00, 0x52, 0x0F,
+            0xC3, 0xC1, 0xAC, 0x0A, 0x14, 0x8C, 0x0C, 0x9D, 0xD4, 0x15, 0xF8, 0xD4, 0xF3, 0xFC, 0x4C, 0x44,
+            0x03, 0x10, 0x06, 0xF6, 0x43, 0xDD, 0x05, 0xE7, 0xA3, 0xEE, 0xDF, 0x00, 0xAC, 0x0A, 0x14, 0x8C,
+            0x0C, 0x9E, 0xFD, 0x11, 0xAA, 0x06, 0x44, 0xF0, 0x03, 0xDD, 0x06, 0x32, 0x03, 0x00, 0xEE, 0xCA,
+            0x00, 0xAC, 0x0A, 0x14, 0x8C, 0x0C, 0x9E, 0xFD, 0x11, 0xAA, 0x08, 0x44, 0xFF, 0xFF, 0xDF, 0x06,
+            0x32, 0x04, 0x00, 0xEE, 0xB5, 0x00, 0xAC, 0x0A, 0x14, 0x8C, 0x0C, 0x9E, 0xFD, 0x11, 0xAA, 0x0A,
+            0x44, 0xFF, 0xFF, 0xDF, 0x06, 0x32, 0x05, 0x00, 0xEE, 0xA0, 0x00, 0xAC, 0x0A, 0x14, 0x8C, 0x0C,
+            0x9E, 0xFD, 0x11, 0xAA, 0x04, 0x24, 0x50, 0x50, 0xDD, 0x0B, 0x24, 0x0A, 0x0A, 0xDD, 0x06, 0x32,
+            0x06, 0x00, 0xEE, 0x86, 0x00, 0xAC, 0x0A, 0x14, 0x8C, 0x0C, 0x9E, 0xFD, 0x11, 0xAA, 0x0A, 0xE7,
+            0x43, 0xDD, 0x77, 0xAC, 0x0A, 0x04, 0x10, 0x00, 0xBB, 0x8C, 0x0C, 0x9C, 0x02, 0xF6, 0xBC, 0x04,
+            0xAC, 0x04, 0x44, 0xF0, 0x03, 0xDE, 0x2E, 0xAB, 0x14, 0x8C, 0x02, 0x9E, 0xFD, 0x11, 0x89, 0x9D,
+            0xDC, 0xF4, 0xDD, 0xF6, 0xBD, 0xDE, 0xAC, 0x06, 0xBD, 0xD8, 0xAC, 0x08, 0xBD, 0xDA, 0xAD, 0xDE,
+            0xFD, 0x5B, 0x22, 0xAD, 0xDA, 0xBC, 0x08, 0xAD, 0xD8, 0xBC, 0x06, 0xAC, 0x04, 0xA1, 0xBC, 0x04,
+            0xAB, 0xA1, 0xBB, 0xEF, 0xCB, 0xAC, 0x06, 0xBD, 0xD8, 0xAC, 0x08, 0xBD, 0xDA, 0xFD, 0xA2, 0x21,
+            0xAD, 0xDA, 0xBC, 0x08, 0xAD, 0xD8, 0xBC, 0x06, 0xAC, 0x0A, 0x14, 0x8C, 0x0C, 0x9D, 0xD6, 0x61,
+            0xB8, 0xD6, 0x11, 0xAA, 0x0E, 0x61, 0x49, 0x08, 0xDF, 0x09, 0x61, 0xB8, 0xD6, 0x11, 0xAA, 0x0C,
+            0x61, 0x49, 0x06, 0xDD, 0x05, 0x32, 0x07, 0x00, 0xEF, 0x01, 0xF7, 0x10, 0x14, 0xC6, 0xD7,
+        };
+        const std::vector<uint8_t> sub_3444C_bytes = {
+            0x14, 0xAE, 0xF8, 0xC7, 0x16, 0xAD, 0xD8, 0xC1, 0xAC, 0x08, 0xBD, 0xD8,
+            0x8C, 0x06, 0x73, 0xAC, 0x04, 0x16, 0xA2, 0xD8, 0xB2, 0xD8, 0xF6, 0x4C, // wait: real bytes of sub_3444C tail:
+        };
+        (void)sub_3444C_bytes;
+
+        rl78dec::MemoryDatabaseProvider db(0x40000, 0);
+        db.write_bytes(0x0A714, conf_bytes);
+        // sub_3444C shared-epilogue BC return (clrw bc / movw bc, ax -> pop ax; movw tmp_buf0, ax; pop hl; ret)
+        db.write_bytes(0x3444C, {
+            0x14, 0xAE, 0xF8, 0xC7, 0x16, 0xAD, 0xD8, 0xC1,
+            0x4C, 0x00, 0xDD, 0x05, 0x32, 0x01, 0x00, 0xEF, 0x01, 0xF7,
+            0xC0, 0xBD, 0xD8, 0xC6, 0xD7
+        });
+        db.write_bytes(0x0225B, {0xD7});
+        db.write_bytes(0x021A2, {0xD7});
+        db.add_func_entry(0x0A714, "process_CONF");
+        db.add_func_entry(0x3444C, "sub_3444C");
+        db.add_func_entry(0x0225B, "sub_225B");
+        db.add_func_entry(0x021A2, "sub_21A2");
+
+        rl78dec::DecompileOptions opts;
+        opts.verify_ir = true;
+        auto img = rl78dec::decompile_image(db, {0x0A714, 0x3444C, 0x0225B, 0x021A2}, opts);
+        CHECK(img.errors.empty(), "decompile_image failed on process_CONF");
+        const auto &res = img.funcs.at(0x0A714);
+        CHECK(res.ok && res.ir_func && res.ir_func->problems.empty(), "process_CONF IR verification failed");
+        CHECK(res.c_text.find("uint16_t process_CONF(") != std::string::npos,
+              "process_CONF must return uint16_t (BC), got:\n" + res.c_text);
+        for (int rc = 0; rc <= 7; ++rc) {
+            std::string needle = "return " + std::to_string(rc) + ";";
+            CHECK(res.c_text.find(needle) != std::string::npos,
+                  "process_CONF missing `" + needle + "` in:\n" + res.c_text);
+        }
+        CHECK(res.c_text.find("CY =") == std::string::npos,
+              "Unnecessary `CY =` leaked into process_CONF:\n" + res.c_text);
+        CHECK(res.c_text.find("ZF =") == std::string::npos,
+              "Unnecessary `ZF =` leaked into process_CONF:\n" + res.c_text);
+        CHECK(res.c_text.find("es_mem8") == std::string::npos && res.c_text.find("mem8") == std::string::npos,
+              "mem8/es_mem8 leaked into process_CONF:\n" + res.c_text);
+        CHECK(res.cfunc && res.cfunc->lvars.size() <= 18,
+              "Excessive temporary variables remained in process_CONF:\n" + res.c_text);
+
+        std::string diag;
+        CHECK(compile_check_c_src(img.listing_text, &diag),
+              "process_CONF listing failed cl.exe /Zs /W3 /TC:\n" + diag + "\n" + img.listing_text);
+    }
+
+    // Part B: Differential semantic execution vs Rl78RefMachine across all shared-epilogue BC return paths
+    // (1, 3, 4, 5, 6, 0-early, 7-hi-mismatch, 7-lo-mismatch, 0-crc-match) with zero manual prototype!
+    {
+        // Memory layout at 0xF2000 (header struct):
+        //   0xF2000 (+0): magic16  (must be 0x5050 or 0x5A5A, else return 6)
+        //   0xF2002 (+2): len16    (must be 0x03F0, else return 3)
+        //   0xF2004 (+4): field8   (must != 0xFFFF, else return 4)
+        //   0xF2006 (+6): mode16   (must != 0xFFFF, else return 5; if == 1, early return 0)
+        //   0xF2008 (+8): crc_lo   (compared against [hl+0] = 0x1234)
+        //   0xF200A (+A): crc_hi   (compared against [hl+2] = 0x5678, else return 7; if both match return 0)
+        // Entry arg: A = slot (if A >= 2, return 1)
+        const std::vector<uint8_t> code = {
+            0xC7,                   // 0100: push hl
+            0xC1,                   // 0101: push ax
+            0x20, 0x04,             // 0102: subw sp, #4
+            0xAE, 0xF8,             // 0104: movw ax, sp
+            0x16,                   // 0106: movw hl, ax
+            0x30, 0x34, 0x12,       // 0107: movw ax, #0x1234
+            0xB8, 0x00,             // 010A: movw [sp+0], ax
+            0x30, 0x78, 0x56,       // 010C: movw ax, #0x5678
+            0xB8, 0x02,             // 010F: movw [sp+2], ax
+            0x8C, 0x05,             // 0111: mov a, [hl+5]   (homed A from push ax at sp+4: X=+4, A=+5!)
+            0x4C, 0x02,             // 0113: cmp a, #2
+            0xDC, 0x04,             // 0115: bc 011B
+            0xE7,                   // 0117: onew bc         (return 1)
+            0xED, 0x6F, 0x01,       // 0118: br !0x016F
+            0xAF, 0x02, 0x20,       // 011B: movw ax, !0x2002
+            0x44, 0xF0, 0x03,       // 011E: cmpw ax, #0x03F0
+            0xDD, 0x06,             // 0121: bz 0129
+            0x32, 0x03, 0x00,       // 0123: movw bc, #3     (return 3)
+            0xED, 0x6F, 0x01,       // 0126: br !0x016F
+            0xAF, 0x04, 0x20,       // 0129: movw ax, !0x2004
+            0x44, 0xFF, 0xFF,       // 012C: cmpw ax, #0xFFFF
+            0xDF, 0x06,             // 012F: bnz 0137
+            0x32, 0x04, 0x00,       // 0131: movw bc, #4     (return 4)
+            0xED, 0x6F, 0x01,       // 0134: br !0x016F
+            0xAF, 0x06, 0x20,       // 0137: movw ax, !0x2006
+            0x44, 0xFF, 0xFF,       // 013A: cmpw ax, #0xFFFF
+            0xDF, 0x06,             // 013D: bnz 0145
+            0x32, 0x05, 0x00,       // 013F: movw bc, #5     (return 5)
+            0xED, 0x6F, 0x01,       // 0142: br !0x016F
+            0xAF, 0x00, 0x20,       // 0145: movw ax, !0x2000
+            0x24, 0x50, 0x50,       // 0148: subw ax, #0x5050
+            0xDD, 0x0B,             // 014B: bz 0158
+            0x24, 0x0A, 0x0A,       // 014D: subw ax, #0x0A0A
+            0xDD, 0x06,             // 0150: bz 0158
+            0x32, 0x06, 0x00,       // 0152: movw bc, #6     (return 6)
+            0xED, 0x6F, 0x01,       // 0155: br !0x016F
+            0xAF, 0x06, 0x20,       // 0158: movw ax, !0x2006
+            0xE7,                   // 015B: onew bc
+            0x43,                   // 015C: cmpw ax, bc
+            0xDD, 0x0F,             // 015D: bz 016E         (early return 0)
+            0xAF, 0x0A, 0x20,       // 015F: movw ax, !0x200A
+            0x61, 0x49, 0x02,       // 0162: cmpw ax, [hl+2]
+            0xDF, 0x06,             // 0165: bnz 016D        (short-circuit to bz 016E!)
+            0xAF, 0x08, 0x20,       // 0167: movw ax, !0x2008
+            0x61, 0x49, 0x00,       // 016A: cmpw ax, [hl+0]
+            0xDD, 0x05,             // 016D: bz 0174? Wait: 016D+2=016F; we want bz 016E!
+        };
+        (void)code;
+        // Exact branch offsets around 0x0158..0x0174:
+        // 0158: AF 06 20       movw ax, !0x2006
+        // 015B: E7             onew bc
+        // 015C: 43             cmpw ax, bc
+        // 015D: DD 14          bz 0173          (015F + 0x14 = 0x0173: clrw bc)
+        // 015F: AF 0A 20       movw ax, !0x200A
+        // 0162: 61 49 02       cmpw ax, [hl+2]
+        // 0165: DF 06          bnz 016D         (0167 + 0x06 = 0x016D: bz 0173)
+        // 0167: AF 08 20       movw ax, !0x2008
+        // 016A: 61 49 00       cmpw ax, [hl+0]
+        // 016D: DD 04          bz 0173          (016F + 0x04 = 0x0173: clrw bc)
+        // 016F: 32 07 00       movw bc, #7
+        // 0172: EF 01          br 0175          (0174 + 0x01 = 0x0175: epilogue)
+        // 0174? Wait: 016F + 3 = 0172; EF 01 is 2 bytes (0172..0174), 0174 + 1 = 0175!
+        // So 0x0174 is `F7` (clrw bc), and 0x0175 is `10 06 C6 D7` (addw sp, #6; pop hl; ret)!
+        // Recheck targets:
+        //   015D: DD 15 -> 015F + 0x15 = 0x0174 (clrw bc)
+        //   016D: DD 05 -> 016F + 0x05 = 0x0174 (clrw bc)
+        //   All early `br !epilogue`: ED 75 01 (jumps to 0x0175)!
+        const std::vector<uint8_t> vcode = {
+            0xC7, 0xC1, 0x20, 0x04, 0xAE, 0xF8, 0x16,
+            0x30, 0x34, 0x12, 0xB8, 0x00,
+            0x30, 0x78, 0x56, 0xB8, 0x02,
+            0x8C, 0x05, 0x4C, 0x02, 0xDC, 0x04, 0xE7, 0xED, 0x75, 0x01,
+            0xAF, 0x02, 0x20, 0x44, 0xF0, 0x03, 0xDD, 0x06, 0x32, 0x03, 0x00, 0xED, 0x75, 0x01,
+            0xAF, 0x04, 0x20, 0x44, 0xFF, 0xFF, 0xDF, 0x06, 0x32, 0x04, 0x00, 0xED, 0x75, 0x01,
+            0xAF, 0x06, 0x20, 0x44, 0xFF, 0xFF, 0xDF, 0x06, 0x32, 0x05, 0x00, 0xED, 0x75, 0x01,
+            0xAF, 0x00, 0x20, 0x24, 0x50, 0x50, 0xDD, 0x0B, 0x24, 0x0A, 0x0A, 0xDD, 0x06, 0x32, 0x06, 0x00, 0xED, 0x75, 0x01,
+            0xAF, 0x06, 0x20, 0xE7, 0x43, 0xDD, 0x15,
+            0xAF, 0x0A, 0x20, 0x61, 0x49, 0x02, 0xDF, 0x06,
+            0xAF, 0x08, 0x20, 0x61, 0x49, 0x00,
+            0xDD, 0x05,
+            0x32, 0x07, 0x00, 0xEF, 0x01,
+            0xF7,
+            0x10, 0x06, 0xC6, 0xD7
+        };
+
+        auto res = decompile_bytes(vcode, 0x0100, "validate_conf");
+        CHECK(res.ok && res.ir_func && res.ir_func->problems.empty(), "validate_conf decompile failed");
+        CHECK(res.c_text.find("uint16_t validate_conf(") != std::string::npos,
+              "Expected auto-inferred uint16_t return on validate_conf:\n" + res.c_text);
+        CHECK(res.c_text.find("CY =") == std::string::npos && res.c_text.find("ZF =") == std::string::npos,
+              "CY/ZF noise leaked in validate_conf:\n" + res.c_text);
+        std::string diag;
+        CHECK(compile_check_c_src(res.c_text, &diag), "validate_conf cl.exe /Zs failed:\n" + diag + "\n" + res.c_text);
+
+        struct HdrVec {
+            uint8_t slot;
+            uint16_t magic, len, f8, mode, crc_lo, crc_hi;
+        };
+        std::vector<HdrVec> vecs = {
+            {2, 0x5050, 0x03F0, 0x0001, 0x0002, 0x1234, 0x5678}, // slot >= 2 -> 1
+            {0, 0x5050, 0x0100, 0x0001, 0x0002, 0x1234, 0x5678}, // len != 0x3F0 -> 3
+            {1, 0x5050, 0x03F0, 0xFFFF, 0x0002, 0x1234, 0x5678}, // f8 == 0xFFFF -> 4
+            {0, 0x5050, 0x03F0, 0x0001, 0xFFFF, 0x1234, 0x5678}, // mode == 0xFFFF -> 5
+            {0, 0x1111, 0x03F0, 0x0001, 0x0002, 0x1234, 0x5678}, // bad magic -> 6
+            {0, 0x5050, 0x03F0, 0x0001, 0x0001, 0x9999, 0x9999}, // mode == 1 -> early 0
+            {1, 0x5A5A, 0x03F0, 0x0001, 0x0002, 0x1234, 0x9999}, // crc_hi mismatch -> 7
+            {1, 0x5A5A, 0x03F0, 0x0001, 0x0002, 0x9999, 0x5678}, // crc_lo mismatch -> 7
+            {1, 0x5A5A, 0x03F0, 0x0001, 0x0002, 0x1234, 0x5678}, // full match -> 0
+        };
+        std::vector<std::string> expected;
+        std::ostringstream cs;
+        for (size_t i = 0; i < vecs.size(); ++i) {
+            const auto &v = vecs[i];
+            auto mp = std::make_unique<Rl78RefMachine>();
+            mp->reset(0x0100);
+            mp->load_bytes(0x0100, vcode);
+            mp->set_AX(static_cast<uint16_t>(v.slot) << 8);
+            mp->wr16(0xF2000, v.magic);
+            mp->wr16(0xF2002, v.len);
+            mp->wr16(0xF2004, v.f8);
+            mp->wr16(0xF2006, v.mode);
+            mp->wr16(0xF2008, v.crc_lo);
+            mp->wr16(0xF200A, v.crc_hi);
+            mp->run();
+            expected.push_back("vconf:" + std::to_string(i) + "=" + hex16(mp->BC()));
+
+            cs << "    RL78_MEM16(0xF2000) = 0x" << hex16(v.magic) << ";\n"
+               << "    RL78_MEM16(0xF2002) = 0x" << hex16(v.len) << ";\n"
+               << "    RL78_MEM16(0xF2004) = 0x" << hex16(v.f8) << ";\n"
+               << "    RL78_MEM16(0xF2006) = 0x" << hex16(v.mode) << ";\n"
+               << "    RL78_MEM16(0xF2008) = 0x" << hex16(v.crc_lo) << ";\n"
+               << "    RL78_MEM16(0xF200A) = 0x" << hex16(v.crc_hi) << ";\n"
+               << "    printf(\"vconf:" << i << "=%04X\\n\", (unsigned)validate_conf("
+               << static_cast<unsigned>(v.slot) << "u));\n";
+        }
+        std::string tu = res.c_text + "\nint main(void) {\n" + cs.str() + "    return 0;\n}\n";
+        std::string stdout_s, err_s;
+        CHECK(compile_and_run_c_exe(tu, stdout_s, err_s), "validate_conf cl.exe run failed:\n" + err_s + "\n" + tu);
+        std::vector<std::string> got;
+        std::istringstream iss(stdout_s);
+        std::string ln;
+        while (std::getline(iss, ln)) {
+            while (!ln.empty() && (ln.back() == '\r' || ln.back() == '\n')) ln.pop_back();
+            if (!ln.empty()) got.push_back(ln);
+        }
+        if (got != expected) {
+            std::ostringstream d;
+            d << "Differential mismatch on validate_conf!\n" << res.c_text << "\nExpected vs Got:\n";
+            for (size_t i = 0; i < std::max(expected.size(), got.size()); ++i) {
+                d << "  exp=" << (i < expected.size() ? expected[i] : "<missing>")
+                  << "  got=" << (i < got.size() ? got[i] : "<missing>") << "\n";
+            }
+            CHECK(false, d.str());
+        }
+    }
+    pass_msg(kTestName);
+}
+
+void test_adv_guard_clause_stop_ea_nonpure_epilogue() {
+    const std::string kTestName = "test_adv_guard_clause_stop_ea_nonpure_epilogue";
+    // Outer if (A == 0) merges with else arm at non-pure Ret epilogue E (0x0124: writes !0x2000 = 0x99; ret).
+    // Inside then-arm: if (X < 5) { bc = 0x0011; br E; } else { !0x2002 = 0x1111; bc = (!0x2004 == 9 ? 0x0044 : 0x0022); ret; }
+    // Tests guard-clause flattening when taken arm targets stop_ea (E).
+    const std::vector<uint8_t> code = {
+        0x4C, 0x00,             // 0100: cmp a, #0
+        0xDF, 0x1D,             // 0102: bnz 0121
+        0x60,                   // 0104: mov a, x
+        0x4C, 0x05,             // 0105: cmp a, #5
+        0x32, 0x11, 0x00,       // 0107: movw bc, #0x0011
+        0xDC, 0x18,             // 010A: bc 0124 (E)
+        0x30, 0x11, 0x11,       // 010C: movw ax, #0x1111
+        0xBF, 0x02, 0x20,       // 010F: movw !0x2002, ax
+        0x8F, 0x04, 0x20,       // 0112: mov a, !0x2004
+        0x4C, 0x09,             // 0115: cmp a, #9
+        0xDD, 0x04,             // 0117: bz 011D
+        0x32, 0x22, 0x00,       // 0119: movw bc, #0x0022
+        0xD7,                   // 011C: ret
+        0x32, 0x44, 0x00,       // 011D: movw bc, #0x0044
+        0xD7,                   // 0120: ret
+        0x32, 0x33, 0x00,       // 0121: movw bc, #0x0033 (else arm falls into E)
+        0x51, 0x99,             // 0124: mov a, #0x99 (E)
+        0x9F, 0x00, 0x20,       // 0126: mov !0x2000, a
+        0xD7,                   // 0129: ret
+    };
+    auto res = decompile_bytes(code, 0x0100, "guard_stop_ea");
+    CHECK(res.ok && res.ir_func && res.ir_func->problems.empty(), "Decompile failed");
+    std::string diag;
+    CHECK(compile_check_c_src(res.c_text, &diag), "cl.exe /Zs failed:\n" + diag + "\n" + res.c_text);
+
+    struct Vec { uint8_t a, x, m4; };
+    std::vector<Vec> vecs = {{0, 2, 0}, {0, 7, 1}, {0, 7, 9}, {1, 2, 0}};
+    std::vector<std::string> expected;
+    std::ostringstream cs;
+    for (size_t i = 0; i < vecs.size(); ++i) {
+        const auto &v = vecs[i];
+        auto mp = std::make_unique<Rl78RefMachine>();
+        mp->reset(0x0100);
+        mp->load_bytes(0x0100, code);
+        mp->set_AX(static_cast<uint16_t>((static_cast<uint16_t>(v.a) << 8) | v.x));
+        mp->wr8(0xF2004, v.m4);
+        mp->run();
+        std::ostringstream exp;
+        exp << "gse:" << i << "=" << hex16(mp->BC()) << ":" << hex8(mp->rd8(0xF2000)) << ":" << hex16(mp->rd16(0xF2002));
+        expected.push_back(exp.str());
+
+        uint16_t ax = static_cast<uint16_t>((static_cast<uint16_t>(v.a) << 8) | v.x);
+        cs << "    RL78_MEM8(0xF2000) = 0; RL78_MEM16(0xF2002) = 0; RL78_MEM8(0xF2004) = " << (unsigned)v.m4 << ";\n"
+           << "    { uint16_t r = (uint16_t)guard_stop_ea(0x" << hex16(ax) << ");\n"
+           << "      printf(\"gse:" << i << "=%04X:%02X:%04X\\n\", (unsigned)r, (unsigned)RL78_MEM8(0xF2000), (unsigned)RL78_MEM16(0xF2002)); }\n";
+    }
+    std::string tu = res.c_text + "\nint main(void) {\n" + cs.str() + "    return 0;\n}\n";
+    std::string stdout_s, err_s;
+    CHECK(compile_and_run_c_exe(tu, stdout_s, err_s), "cl.exe run failed:\n" + err_s + "\n" + tu);
+    std::vector<std::string> got;
+    std::istringstream iss(stdout_s);
+    std::string ln;
+    while (std::getline(iss, ln)) {
+        while (!ln.empty() && (ln.back() == '\r' || ln.back() == '\n')) ln.pop_back();
+        if (!ln.empty()) got.push_back(ln);
+    }
+    CHECK(got == expected, "Differential mismatch in " + kTestName + ":\n" + res.c_text + "\n" + stdout_s);
+    pass_msg(kTestName);
+}
+
+void test_adv_psw_bittest_and_read_after_cmp() {
+    const std::string kTestName = "test_adv_psw_bittest_and_read_after_cmp";
+    // cmp a, #5; bt psw.0, taken (31 82 FA 03) -> clrb a / oneb a; ret
+    const std::vector<uint8_t> code = {
+        0x4C, 0x05,             // 0100: cmp a, #5
+        0x31, 0x82, 0xFA, 0x03, // 0102: bt sfr(PSW).0, 0109
+        0xF1,                   // 0106: clrb a
+        0xEF, 0x01,             // 0107: br 010A
+        0xE1,                   // 0109: oneb a
+        0xD7,                   // 010A: ret
+    };
+    auto res = decompile_bytes(code, 0x0100, "psw_bt_cy");
+    CHECK(res.ok && res.ir_func && res.ir_func->problems.empty(), "Decompile failed");
+    std::string diag;
+    CHECK(compile_check_c_src(res.c_text, &diag), "cl.exe /Zs failed:\n" + diag + "\n" + res.c_text);
+
+    std::vector<uint8_t> inputs = {0, 4, 5, 6, 0xFF};
+    std::vector<std::string> expected;
+    std::ostringstream cs;
+    for (size_t i = 0; i < inputs.size(); ++i) {
+        auto mp = std::make_unique<Rl78RefMachine>();
+        mp->reset(0x0100);
+        mp->load_bytes(0x0100, code);
+        mp->set_AX(static_cast<uint16_t>(inputs[i]) << 8);
+        mp->run();
+        expected.push_back("pswbt:" + std::to_string(i) + "=" + hex8(mp->A()));
+        cs << "    printf(\"pswbt:" << i << "=%02X\\n\", (unsigned)(uint8_t)psw_bt_cy(" << (unsigned)inputs[i] << "u));\n";
+    }
+    std::string tu = res.c_text + "\nint main(void) {\n" + cs.str() + "    return 0;\n}\n";
+    std::string stdout_s, err_s;
+    CHECK(compile_and_run_c_exe(tu, stdout_s, err_s), "cl.exe run failed:\n" + err_s + "\n" + tu);
+    std::vector<std::string> got;
+    std::istringstream iss(stdout_s);
+    std::string ln;
+    while (std::getline(iss, ln)) {
+        while (!ln.empty() && (ln.back() == '\r' || ln.back() == '\n')) ln.pop_back();
+        if (!ln.empty()) got.push_back(ln);
+    }
+    CHECK(got == expected, "Differential mismatch in " + kTestName + ":\n" + res.c_text + "\n" + stdout_s);
+    pass_msg(kTestName);
+}
+
+void test_adv_bc_vs_c_return_truncation() {
+    const std::string kTestName = "test_adv_bc_vs_c_return_truncation";
+    // Path 1 returns full 16-bit BC = 0x1234; Path 2 writes B=0 and C=0x56 via 8-bit movs.
+    // Must infer uint16_t return, NEVER truncate 0x1234 to uint8_t (0x34)!
+    const std::vector<uint8_t> code = {
+        0xD1,                   // 0100: cmp0 a
+        0xDD, 0x04,             // 0101: bz 0107
+        0x32, 0x34, 0x12,       // 0103: movw bc, #0x1234
+        0xD7,                   // 0106: ret
+        0xF3,                   // 0107: clrb b
+        0x52, 0x56,             // 0108: mov c, #0x56
+        0xD7,                   // 010A: ret
+    };
+    auto res = decompile_bytes(code, 0x0100, "bc_or_c_ret");
+    CHECK(res.ok && res.ir_func && res.ir_func->problems.empty(), "Decompile failed");
+    std::string diag;
+    CHECK(compile_check_c_src(res.c_text, &diag), "cl.exe /Zs failed:\n" + diag + "\n" + res.c_text);
+
+    std::vector<uint8_t> inputs = {0, 1, 0xFF};
+    std::vector<std::string> expected;
+    std::ostringstream cs;
+    for (size_t i = 0; i < inputs.size(); ++i) {
+        auto mp = std::make_unique<Rl78RefMachine>();
+        mp->reset(0x0100);
+        mp->load_bytes(0x0100, code);
+        mp->set_AX(static_cast<uint16_t>(inputs[i]) << 8);
+        mp->run();
+        expected.push_back("bcc:" + std::to_string(i) + "=" + hex16(mp->BC()));
+        cs << "    printf(\"bcc:" << i << "=%04X\\n\", (unsigned)(uint16_t)bc_or_c_ret(" << (unsigned)inputs[i] << "u));\n";
+    }
+    std::string tu = res.c_text + "\nint main(void) {\n" + cs.str() + "    return 0;\n}\n";
+    std::string stdout_s, err_s;
+    CHECK(compile_and_run_c_exe(tu, stdout_s, err_s), "cl.exe run failed:\n" + err_s + "\n" + tu);
+    std::vector<std::string> got;
+    std::istringstream iss(stdout_s);
+    std::string ln;
+    while (std::getline(iss, ln)) {
+        while (!ln.empty() && (ln.back() == '\r' || ln.back() == '\n')) ln.pop_back();
+        if (!ln.empty()) got.push_back(ln);
+    }
+    CHECK(got == expected, "Differential mismatch in " + kTestName + ":\n" + res.c_text + "\n" + stdout_s);
+    pass_msg(kTestName);
+}
+
+void test_adv_shared_epilogue_with_mem_store_and_multi_z_join() {
+    const std::string kTestName = "test_adv_shared_epilogue_with_mem_store_and_multi_z_join";
+    // Shared non-pure epilogue (`pop hl; ret` with extra mem store in one arm AFTER setting bc = 3)
+    // plus multi-pred Z join where arm1 uses `sub a, x` and arm2 uses `cmp a, #5`.
+    const std::vector<uint8_t> code = {
+        0xC7,                   // 0100: push hl
+        0xC1,                   // 0101: push ax
+        0xAE, 0xF8,             // 0102: movw ax, sp
+        0x16,                   // 0104: movw hl, ax
+        0x8C, 0x01,             // 0105: mov a, [hl+1]  (A param)
+        0x4C, 0x02,             // 0107: cmp a, #2
+        0xDC, 0x08,             // 0109: bc 0113
+        0x32, 0x03, 0x00,       // 010B: movw bc, #3
+        0x51, 0x77,             // 010E: mov a, #0x77
+        0x9F, 0x00, 0x20,       // 0110: mov !0x2000, a  (mem store AFTER setting BC!)
+        0xEF, 0x0A,             // 0113? Wait: let's jump to 011D (epilogue): 0115 + 0x08 = 0x011D!
+        // Let's re-index from 0113 cleanly below!
+    };
+    (void)code;
+    const std::vector<uint8_t> fcode = {
+        0xC7,                   // 0100: push hl
+        0xC1,                   // 0101: push ax
+        0xAE, 0xF8,             // 0102: movw ax, sp
+        0x16,                   // 0104: movw hl, ax
+        0x8C, 0x01,             // 0105: mov a, [hl+1]   (A)
+        0x4C, 0x02,             // 0107: cmp a, #2
+        0xDC, 0x0A,             // 0109: bc 0115         (010B + 0x0A = 0x0115)
+        0x32, 0x03, 0x00,       // 010B: movw bc, #3
+        0x51, 0x77,             // 010E: mov a, #0x77
+        0x9F, 0x00, 0x20,       // 0110: mov !0x2000, a  (mem store after setting BC!)
+        0xEF, 0x0D,             // 0113: br 0122         (0115 + 0x0D = 0x0122)
+        0x8C, 0x00,             // 0115: mov a, [hl+0]   (X)
+        0x4C, 0x05,             // 0117: cmp a, #5
+        0xDD, 0x05,             // 0119: bz 0120         (011B + 0x05 = 0x0120)
+        0x32, 0x04, 0x00,       // 011B: movw bc, #4
+        0xEF, 0x02,             // 011E: br 0122         (0120 + 0x02 = 0x0122)
+        0xF7,                   // 0120: clrw bc
+        0x51, 0x88,             // 0121: mov a, #0x88    (Wait: pad/match epilogue at 0122! Move clrw bc to 0120, epilogue at 0121? Let's keep 0122!)
+    };
+    (void)fcode;
+    // Exact byte layout:
+    // 0100: C7          push hl
+    // 0101: C1          push ax
+    // 0102: AE F8       movw ax, sp
+    // 0104: 16          movw hl, ax
+    // 0105: 8C 01       mov a, [hl+1]
+    // 0107: 4C 02       cmp a, #2
+    // 0109: DC 0A       bc 0115
+    // 010B: 32 03 00    movw bc, #3
+    // 010E: 51 77       mov a, #0x77
+    // 0110: 9F 00 20    mov !0x2000, a
+    // 0113: EF 0C       br 0121       (0115 + 0x0C = 0x0121)
+    // 0115: 8C 00       mov a, [hl+0]
+    // 0117: 4C 05       cmp a, #5
+    // 0119: DD 05       bz 0120       (011B + 0x05 = 0x0120)
+    // 011B: 32 04 00    movw bc, #4
+    // 011E: EF 01       br 0121       (0120 + 0x01 = 0x0121)
+    // 0120: F7          clrw bc
+    // 0121: C0          pop ax        (non-hidden epilogue work: pop ax; movw !0x2002, ax; pop hl; ret)
+    // 0122: BF 02 20    movw !0x2002, ax
+    // 0125: C6          pop hl
+    // 0126: D7          ret
+    const std::vector<uint8_t> acode = {
+        0xC7, 0xC1, 0xAE, 0xF8, 0x16,
+        0x8C, 0x01, 0x4C, 0x02, 0xDC, 0x0A,
+        0x32, 0x03, 0x00, 0x51, 0x77, 0x9F, 0x00, 0x20, 0xEF, 0x0C,
+        0x8C, 0x00, 0x4C, 0x05, 0xDD, 0x05,
+        0x32, 0x04, 0x00, 0xEF, 0x01,
+        0xF7,
+        0xC0, 0xBF, 0x02, 0x20, 0xC6, 0xD7
+    };
+    auto res = decompile_bytes(acode, 0x0100, "shared_ep_mem");
+    CHECK(res.ok && res.ir_func && res.ir_func->problems.empty(), "Decompile failed");
+    std::string diag;
+    CHECK(compile_check_c_src(res.c_text, &diag), "cl.exe /Zs failed:\n" + diag + "\n" + res.c_text);
+
+    struct Vec { uint8_t a, x; };
+    std::vector<Vec> vecs = {{2, 0}, {0, 5}, {1, 9}};
+    std::vector<std::string> expected;
+    std::ostringstream cs;
+    for (size_t i = 0; i < vecs.size(); ++i) {
+        const auto &v = vecs[i];
+        auto mp = std::make_unique<Rl78RefMachine>();
+        mp->reset(0x0100);
+        mp->load_bytes(0x0100, acode);
+        uint16_t ax = static_cast<uint16_t>((static_cast<uint16_t>(v.a) << 8) | v.x);
+        mp->set_AX(ax);
+        mp->run();
+        expected.push_back("sepm:" + std::to_string(i) + "=" + hex16(mp->BC()) + ":" + hex8(mp->rd8(0xF2000)));
+        cs << "    RL78_MEM8(0xF2000) = 0; RL78_MEM16(0xF2002) = 0;\n"
+           << "    { uint16_t r = (uint16_t)shared_ep_mem(0x" << hex16(ax) << ");\n"
+           << "      printf(\"sepm:" << i << "=%04X:%02X\\n\", (unsigned)r, (unsigned)RL78_MEM8(0xF2000)); }\n";
+    }
+    std::string tu = res.c_text + "\nint main(void) {\n" + cs.str() + "    return 0;\n}\n";
+    std::string stdout_s, err_s;
+    CHECK(compile_and_run_c_exe(tu, stdout_s, err_s), "cl.exe run failed:\n" + err_s + "\n" + tu);
+    std::vector<std::string> got;
+    std::istringstream iss(stdout_s);
+    std::string ln;
+    while (std::getline(iss, ln)) {
+        while (!ln.empty() && (ln.back() == '\r' || ln.back() == '\n')) ln.pop_back();
+        if (!ln.empty()) got.push_back(ln);
+    }
+    CHECK(got == expected, "Differential mismatch in " + kTestName + ":\n" + res.c_text + "\n" + stdout_s);
+    pass_msg(kTestName);
+}
+
 } // namespace
 
 int main() {
@@ -2508,6 +3014,11 @@ int main() {
     test_array_of_structs_byte_index_native_c();
     test_multi_block_es_with_const_hl_folds_to_symbol();
     test_multi_block_es_0f_with_const_hl();
+    test_process_conf_shared_epilogue_returns_and_no_flag_noise();
+    test_adv_guard_clause_stop_ea_nonpure_epilogue();
+    test_adv_psw_bittest_and_read_after_cmp();
+    test_adv_bc_vs_c_return_truncation();
+    test_adv_shared_epilogue_with_mem_store_and_multi_z_join();
 
     run_differential_suite();
 

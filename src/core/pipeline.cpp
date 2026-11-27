@@ -62,8 +62,20 @@ DecompileResult decompile_decoded_function(const IDatabaseProvider &db,
     // 3. Eliminate register spills / stack noise
     eliminate_spills(*func, frame_info);
 
+    // 3b. Duplicate pure-epilogue Ret blocks into Goto/Fall predecessors & thread known-flag jumps
+    duplicate_epilogue_returns(*func, frame_info);
+    thread_condition_jumps(*func, frame_info);
+
     // 4. Resolve Z/CY flags ONCE after folding so branches inherit folded FlagDefs + carry chains
     resolve_flags(*func);
+    for (const auto &[bid, blk] : func->blocks) {
+        for (const auto &st : blk->stmts) {
+            if (st && (st->kind == StmtKind::Assign || st->kind == StmtKind::Compare)) {
+                st->z_flag.reset();
+                st->cy_flag.reset();
+            }
+        }
+    }
 
     // 5. Infer signature & calling convention
     std::string uproto = opts.user_data.proto.value_or("");
@@ -81,6 +93,9 @@ DecompileResult decompile_decoded_function(const IDatabaseProvider &db,
 
     // 7. Second optimization pass over recovered variables (never synthesize raw GPR aliases)
     optimize(*func, opts.default_bank, &db, false);
+
+    // 7b. Eliminate dead synthetic variables & inline single-use compiler temporaries
+    eliminate_dead_and_single_use_vars(*func, frame_info, sig, opts.user_data);
 
     // 8. Optional IR integrity check
     if (opts.verify_ir) {
@@ -206,6 +221,8 @@ DecompileImageResult decompile_image(const IDatabaseProvider &db,
         FrameInfo fi = analyze_frame(*tmp_fn, ida_frame ? &*ida_frame : nullptr);
         optimize(*tmp_fn, opts.default_bank, &db);
         eliminate_spills(*tmp_fn, fi);
+        duplicate_epilogue_returns(*tmp_fn, fi);
+        thread_condition_jumps(*tmp_fn, fi);
         resolve_flags(*tmp_fn);
         std::string uproto;
         if (auto idap = db.get_ida_func_proto(fea); idap.has_value()) uproto = *idap;

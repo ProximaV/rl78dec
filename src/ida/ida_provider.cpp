@@ -314,23 +314,56 @@ std::optional<SwitchInfo> IdaDatabaseProvider::get_switch_info(uint32_t br_ea) c
 std::optional<CallerConsensus> IdaDatabaseProvider::compute_caller_consensus_uncached(uint32_t func_ea) const {
     CallerConsensus cc;
     int call_cnt = 0, ax_cnt = 0, bc_cnt = 0;
+    auto op_mentions_ax = [](const Operand &op) {
+        if (op.mode == OpMode::Reg) return op.reg == RegId::AX || op.reg == RegId::A || op.reg == RegId::X;
+        if (op.mode == OpMode::Ind || op.mode == OpMode::Idx16 || op.mode == OpMode::Hloff) {
+            return op.base_reg == RegId::AX || op.base_reg == RegId::A || op.base_reg == RegId::X;
+        }
+        return false;
+    };
+    auto op_mentions_bc = [](const Operand &op) {
+        if (op.mode == OpMode::Reg) return op.reg == RegId::BC || op.reg == RegId::B || op.reg == RegId::C;
+        if (op.mode == OpMode::Ind || op.mode == OpMode::Idx16 || op.mode == OpMode::Hloff) {
+            return op.base_reg == RegId::BC || op.base_reg == RegId::B || op.base_reg == RegId::C;
+        }
+        return false;
+    };
+
     xrefblk_t xb;
     for (bool ok = xb.first_to(static_cast<ea_t>(func_ea), XREF_ALL); ok; ok = xb.next_to()) {
         if (!xb.iscode || xb.type == fl_JN || xb.type == fl_F) continue;
         ea_t caller_ea = xb.from;
         ea_t prev = caller_ea;
         bool writes_ax = false, writes_bc = false;
+        bool consumed_ax = false, consumed_bc = false;
         for (int step = 0; step < 5; ++step) {
             prev = prev_head(prev, 0);
             if (prev == BADADDR) break;
             auto ins = decode_one(*this, static_cast<uint32_t>(prev));
             if (!ins.has_value()) break;
-            if (ins->ops.size() >= 1 && ins->ops[0].mode == OpMode::Reg) {
-                RegId r = ins->ops[0].reg;
-                if (r == RegId::AX || r == RegId::A || r == RegId::X) writes_ax = true;
-                if (r == RegId::BC || r == RegId::B || r == RegId::C) writes_bc = true;
+            if (is_call_mnem(ins->mnem) || is_stop_mnem(ins->mnem) ||
+                is_cond_branch_mnem(ins->mnem) || is_bit_branch_mnem(ins->mnem)) {
+                break;
             }
-            if (is_call_mnem(ins->mnem) || is_stop_mnem(ins->mnem)) break;
+            bool def_ax = (ins->ops.size() >= 1 && ins->ops[0].mode == OpMode::Reg &&
+                           (ins->ops[0].reg == RegId::AX || ins->ops[0].reg == RegId::A || ins->ops[0].reg == RegId::X));
+            bool def_bc = (ins->ops.size() >= 1 && ins->ops[0].mode == OpMode::Reg &&
+                           (ins->ops[0].reg == RegId::BC || ins->ops[0].reg == RegId::B || ins->ops[0].reg == RegId::C));
+            if (def_ax && !consumed_ax) writes_ax = true;
+            if (def_bc && !consumed_bc) writes_bc = true;
+
+            // If AX/BC was read to write memory or another register (e.g. `movw tmp_buf1, ax`),
+            // any earlier write to AX/BC was a scratch shuttle, not a call argument!
+            if (!writes_ax) {
+                for (size_t oi = (def_ax ? 1 : 0); oi < ins->ops.size(); ++oi) {
+                    if (op_mentions_ax(ins->ops[oi])) consumed_ax = true;
+                }
+            }
+            if (!writes_bc) {
+                for (size_t oi = (def_bc ? 1 : 0); oi < ins->ops.size(); ++oi) {
+                    if (op_mentions_bc(ins->ops[oi])) consumed_bc = true;
+                }
+            }
         }
         ++call_cnt;
         if (writes_ax) ++ax_cnt;
@@ -374,7 +407,34 @@ std::set<std::string> IdaDatabaseProvider::get_callee_preserved_regs(uint32_t ca
     return compute_callee_preserved_uncached(callee_ea);
 }
 
-std::optional<bool> IdaDatabaseProvider::compute_callee_expects_ax_uncached(uint32_t /*callee_ea*/) const {
+std::optional<bool> IdaDatabaseProvider::compute_callee_expects_ax_uncached(uint32_t callee_ea) const {
+    uint32_t cur = callee_ea;
+    for (int step = 0; step < 16; ++step) {
+        auto ins = decode_one(*this, cur);
+        if (!ins.has_value() || ins->size <= 0) return std::nullopt;
+        for (const auto &op : ins->ops) {
+            if (op.mode == OpMode::Reg && (op.reg == RegId::AX || op.reg == RegId::A || op.reg == RegId::X)) {
+                return std::nullopt;
+            }
+            if ((op.mode == OpMode::Ind || op.mode == OpMode::Idx16 || op.mode == OpMode::Hloff) &&
+                (op.base_reg == RegId::AX || op.base_reg == RegId::A || op.base_reg == RegId::X)) {
+                return std::nullopt;
+            }
+        }
+        if (ins->mnem == Mnem::Mulu || ins->mnem == Mnem::Mulh || ins->mnem == Mnem::Mulhu ||
+            ins->mnem == Mnem::Divhu || ins->mnem == Mnem::Divwu ||
+            ins->mnem == Mnem::Mach || ins->mnem == Mnem::Machu ||
+            ins->mnem == Mnem::Movs || ins->mnem == Mnem::Cmps) {
+            return std::nullopt;
+        }
+        if (is_ret_mnem(ins->mnem)) return false;
+        if (is_call_mnem(ins->mnem) || is_stop_mnem(ins->mnem) ||
+            is_cond_branch_mnem(ins->mnem) || is_bit_branch_mnem(ins->mnem) ||
+            is_skip_mnem(ins->mnem) || ins->mnem == Mnem::Br) {
+            return std::nullopt;
+        }
+        cur += static_cast<uint32_t>(ins->size);
+    }
     return std::nullopt;
 }
 
@@ -462,6 +522,8 @@ std::optional<CalleeSigHint> IdaDatabaseProvider::compute_callee_sig_uncached(ui
     FrameInfo fi = analyze_frame(*fn, ida_frame ? &*ida_frame : nullptr);
     optimize(*fn, 0, this);
     eliminate_spills(*fn, fi);
+    duplicate_epilogue_returns(*fn, fi);
+    thread_condition_jumps(*fn, fi);
     resolve_flags(*fn);
     auto consensus = get_caller_consensus(callee_ea);
     FunctionSig sig = infer_function_sig_only(*fn, fi, this, "", consensus ? &*consensus : nullptr);

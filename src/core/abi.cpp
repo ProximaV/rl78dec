@@ -151,30 +151,140 @@ std::pair<std::string, ExprPtr> infer_return(Function &func, const std::unordere
     std::vector<RetCand> exit_info;
     int ret_block_count = 0;
 
-    std::unordered_set<uint32_t> matched_blocks;
+    std::unordered_map<uint32_t, std::vector<uint32_t>> preds;
     for (const auto &[bid, b] : func.blocks) {
-        if (b->stmts.empty() || b->stmts.back()->kind != StmtKind::Ret) continue;
-        ++ret_block_count;
-        if (b->stmts.back()->ret_kind == "reti" || b->stmts.back()->ret_kind == "retb") continue;
+        for (const auto &[how, tgt] : b->succ) preds[tgt].push_back(b->start);
+    }
 
+    struct ScanRes {
+        std::string ctype = "void";
+        ExprPtr cexpr;
+        std::string creg;
+        AtomMask clobbered = 0;
+    };
+
+    auto pick_from_assigned = [](const std::unordered_map<std::string, ExprPtr> &assigned,
+                                 bool allow_const) -> ScanRes {
+        auto pair_const_or_reg = [&](const char *pair_nm, const char *hi_nm, const char *lo_nm) -> ExprPtr {
+            if (assigned.count(pair_nm)) {
+                return (allow_const && assigned.at(pair_nm)->kind == ExprKind::Const)
+                           ? assigned.at(pair_nm)
+                           : Expr::make_reg(pair_nm);
+            }
+            if (assigned.count(hi_nm) && assigned.count(lo_nm)) {
+                const auto &hi = assigned.at(hi_nm);
+                const auto &lo = assigned.at(lo_nm);
+                if (allow_const && hi->kind == ExprKind::Const && lo->kind == ExprKind::Const) {
+                    uint32_t v = ((hi->value & 0xFFu) << 8) | (lo->value & 0xFFu);
+                    return Expr::make_const(v, Width::W);
+                }
+                return Expr::make_reg(pair_nm);
+            }
+            return nullptr;
+        };
+
+        ScanRes r;
+        ExprPtr bc_pair = pair_const_or_reg("bc", "b", "c");
+        ExprPtr ax_pair = pair_const_or_reg("ax", "a", "x");
+        ExprPtr de_pair = pair_const_or_reg("de", "d", "e");
+
+        bool has_bc = (bc_pair != nullptr) || assigned.count("c");
+        bool has_de = (de_pair != nullptr) || assigned.count("e");
+        if (has_bc && has_de) {
+            r.ctype = "uint32_t";
+            r.creg = "de:bc";
+            ExprPtr de_src = de_pair ? de_pair : assigned.at("e");
+            ExprPtr bc_src = bc_pair ? bc_pair : assigned.at("c");
+            if (allow_const && de_src->kind == ExprKind::Const && bc_src->kind == ExprKind::Const) {
+                uint32_t val = ((de_src->value << 16) | bc_src->value) & 0xFFFFFFFFu;
+                r.cexpr = Expr::make_const(val, Width::D);
+            } else {
+                ExprPtr de_part = (allow_const && de_src->kind == ExprKind::Const)
+                                      ? de_src
+                                      : Expr::make_reg(de_pair ? "de" : "e");
+                ExprPtr bc_part = (allow_const && bc_src->kind == ExprKind::Const)
+                                      ? bc_src
+                                      : Expr::make_reg(bc_pair ? "bc" : "c");
+                r.cexpr = consolidate_pair(bc_part, de_part);
+            }
+        } else if (bc_pair) {
+            r.ctype = "uint16_t"; r.creg = "bc"; r.cexpr = bc_pair;
+        } else if (ax_pair) {
+            r.ctype = "uint16_t"; r.creg = "ax"; r.cexpr = ax_pair;
+        } else if (de_pair) {
+            r.ctype = "uint16_t"; r.creg = "de"; r.cexpr = de_pair;
+        } else if (assigned.count("c")) {
+            r.ctype = "uint8_t"; r.creg = "c";
+            r.cexpr = (allow_const && assigned.at("c")->kind == ExprKind::Const) ? assigned.at("c") : Expr::make_reg("c");
+        } else if (assigned.count("a")) {
+            r.ctype = "uint8_t"; r.creg = "a";
+            r.cexpr = (allow_const && assigned.at("a")->kind == ExprKind::Const) ? assigned.at("a") : Expr::make_reg("a");
+        } else if (assigned.count("e")) {
+            r.ctype = "uint8_t"; r.creg = "e";
+            r.cexpr = (allow_const && assigned.at("e")->kind == ExprKind::Const) ? assigned.at("e") : Expr::make_reg("e");
+        } else if (assigned.count("cy")) {
+            r.ctype = "bool"; r.creg = "cy";
+            r.cexpr = (allow_const && assigned.at("cy")->kind == ExprKind::Const) ? assigned.at("cy") : Expr::make_reg("cy");
+        }
+        return r;
+    };
+
+    auto scan_block_tail = [&](const Block &blk, size_t end_excl, AtomMask init_clobbered,
+                               bool allow_const) -> ScanRes {
         std::unordered_map<std::string, ExprPtr> assigned;
-        AtomMask popped_atoms = 0, consumed_atoms = 0;
+        AtomMask popped_atoms = init_clobbered;
+        AtomMask consumed_atoms = init_clobbered;
+        AtomMask total_clobbered = init_clobbered;
 
-        for (size_t idx = b->stmts.size() - 1; idx > 0; --idx) {
-            const auto &s = b->stmts[idx - 1];
+        for (size_t idx = end_excl; idx > 0; --idx) {
+            const auto &s = blk.stmts[idx - 1];
             if (s->kind == StmtKind::Intrinsic && s->name == "pop") {
                 if (!s->args.empty() && s->args[0]->kind == ExprKind::Reg) {
-                    popped_atoms |= reg_atoms_named(s->args[0]->name);
+                    AtomMask m = reg_atoms_named(s->args[0]->name);
+                    popped_atoms |= m;
+                    total_clobbered |= m;
                 }
                 continue;
             }
-            if (hidden.count(s->id)) continue;
+            if (hidden.count(s->id) || s->kind == StmtKind::Nop) continue;
             if (s->kind == StmtKind::Assign) {
-                if (s->dst->kind == ExprKind::Mem) break;
+                if (s->dst->kind == ExprKind::Mem || s->dst->kind == ExprKind::StackVar) {
+                    collect_expr_used_atoms(s->src, consumed_atoms);
+                    if (s->dst->kind == ExprKind::Mem) {
+                        collect_expr_used_atoms(s->dst, consumed_atoms);
+                    }
+                    // If `optimize()` constant/copy-propagated a shuttle `a = val` / `ax = val`
+                    // into this store (`Mem = val`), mark that shuttle register as consumed so a
+                    // `void` function ending in `mov a, #0x77; mov !addr, a; ret` stays `void`,
+                    // without blocking an earlier `movw bc, #3` return value!
+                    if (s->src && (s->src->kind == ExprKind::Const || s->src->kind == ExprKind::Var ||
+                                   s->src->kind == ExprKind::StackVar)) {
+                        const char *shuttle = (s->dst->width == Width::W) ? "ax" : "a";
+                        for (size_t prev_k = idx - 1; prev_k > 0; --prev_k) {
+                            const auto &ps = blk.stmts[prev_k - 1];
+                            if (hidden.count(ps->id)) continue;
+                            if (ps->kind == StmtKind::Assign && ps->dst && ps->dst->kind == ExprKind::Reg) {
+                                if (ps->dst->name == shuttle && expr_eq(ps->src, s->src)) {
+                                    consumed_atoms |= reg_atoms_named(shuttle);
+                                    break;
+                                }
+                                if (regs_overlap(ps->dst->name, shuttle)) break;
+                            } else if (ps->kind == StmtKind::Call) {
+                                break;
+                            }
+                        }
+                    }
+                    total_clobbered |= consumed_atoms;
+                    continue;
+                }
                 if (s->dst->kind == ExprKind::Reg) {
                     const std::string &dn = s->dst->name;
                     AtomMask datoms = reg_atoms_named(dn);
-                    if ((datoms & ~popped_atoms) == datoms && (datoms & ~consumed_atoms) == datoms) {
+                    bool is_spill_pop = (s->src && s->src->kind == ExprKind::Var && s->src->name.rfind("_s", 0) == 0);
+                    total_clobbered |= datoms;
+                    if (is_spill_pop) {
+                        popped_atoms |= datoms;
+                    } else if ((datoms & ~popped_atoms) == datoms && (datoms & ~consumed_atoms) == datoms) {
                         if (!assigned.count(dn)) assigned[dn] = s->src;
                     }
                 }
@@ -183,6 +293,7 @@ std::pair<std::string, ExprPtr> infer_return(Function &func, const std::unordere
                 for (const auto &r : {s->a, s->b}) {
                     if (r && r->kind == ExprKind::Reg) {
                         AtomMask datoms = reg_atoms_named(r->name);
+                        total_clobbered |= datoms;
                         if ((datoms & ~popped_atoms) == datoms && (datoms & ~consumed_atoms) == datoms &&
                             !assigned.count(r->name)) {
                             assigned[r->name] = r;
@@ -195,51 +306,136 @@ std::pair<std::string, ExprPtr> infer_return(Function &func, const std::unordere
                 break;
             }
         }
+        ScanRes res = pick_from_assigned(assigned, allow_const);
+        res.clobbered = total_clobbered;
+        return res;
+    };
 
-        bool has_bc = assigned.count("bc") || assigned.count("c");
-        bool has_de = assigned.count("de") || assigned.count("e");
-        std::string ctype = "void", creg;
-        ExprPtr cexpr;
+    std::unordered_set<uint32_t> matched_blocks;
+    for (const auto &[bid, b] : func.blocks) {
+        if (b->stmts.empty() || b->stmts.back()->kind != StmtKind::Ret) continue;
+        ++ret_block_count;
+        if (b->stmts.back()->ret_kind == "reti" || b->stmts.back()->ret_kind == "retb") continue;
 
-        if (has_bc && has_de) {
-            ctype = "uint32_t";
-            creg = "de:bc";
-            ExprPtr de_src = assigned.count("de") ? assigned["de"] : assigned["e"];
-            ExprPtr bc_src = assigned.count("bc") ? assigned["bc"] : assigned["c"];
-            if (de_src->kind == ExprKind::Const && bc_src->kind == ExprKind::Const) {
-                uint32_t val = ((de_src->value << 16) | bc_src->value) & 0xFFFFFFFFu;
-                cexpr = Expr::make_const(val, Width::D);
-            } else {
-                ExprPtr de_part = (de_src->kind == ExprKind::Const) ? de_src : Expr::make_reg(assigned.count("de") ? "de" : "e");
-                ExprPtr bc_part = (bc_src->kind == ExprKind::Const) ? bc_src : Expr::make_reg(assigned.count("bc") ? "bc" : "c");
-                cexpr = consolidate_pair(bc_part, de_part);
-            }
-        } else if (assigned.count("bc")) {
-            ctype = "uint16_t"; creg = "bc";
-            cexpr = (assigned["bc"]->kind == ExprKind::Const) ? assigned["bc"] : Expr::make_reg("bc");
-        } else if (assigned.count("ax")) {
-            ctype = "uint16_t"; creg = "ax";
-            cexpr = (assigned["ax"]->kind == ExprKind::Const) ? assigned["ax"] : Expr::make_reg("ax");
-        } else if (assigned.count("de")) {
-            ctype = "uint16_t"; creg = "de";
-            cexpr = (assigned["de"]->kind == ExprKind::Const) ? assigned["de"] : Expr::make_reg("de");
-        } else if (assigned.count("c")) {
-            ctype = "uint8_t"; creg = "c";
-            cexpr = (assigned["c"]->kind == ExprKind::Const) ? assigned["c"] : Expr::make_reg("c");
-        } else if (assigned.count("a")) {
-            ctype = "uint8_t"; creg = "a";
-            cexpr = (assigned["a"]->kind == ExprKind::Const) ? assigned["a"] : Expr::make_reg("a");
-        } else if (assigned.count("e")) {
-            ctype = "uint8_t"; creg = "e";
-            cexpr = (assigned["e"]->kind == ExprKind::Const) ? assigned["e"] : Expr::make_reg("e");
-        } else if (assigned.count("cy")) {
-            ctype = "bool"; creg = "cy";
-            cexpr = (assigned["cy"]->kind == ExprKind::Const) ? assigned["cy"] : Expr::make_reg("cy");
+        ScanRes direct = scan_block_tail(*b, b->stmts.size() - 1, 0, true);
+        if (direct.ctype != "void") {
+            exit_info.push_back({b, direct.ctype, direct.cexpr, direct.creg});
+            matched_blocks.insert(b->start);
+            continue;
         }
 
-        if (ctype != "void") {
-            exit_info.push_back({b, ctype, cexpr, creg});
-            matched_blocks.insert(b->start);
+        // Shared epilogue block (e.g. `pop ax; movw tmp_buf0, ax; pop hl; ret` or multi-pred join):
+        // compute all register atoms clobbered/used inside `b`, then inspect `b`'s predecessors!
+        ScanRes ep_scan = scan_block_tail(*b, b->stmts.size() - 1, 0, false);
+        auto pit = preds.find(b->start);
+        if (pit != preds.end() && !pit->second.empty()) {
+            std::vector<ScanRes> pred_cands;
+            bool all_preds_ok = true;
+            for (uint32_t p_ea : pit->second) {
+                auto pbit = func.blocks.find(p_ea);
+                if (pbit == func.blocks.end()) { all_preds_ok = false; break; }
+                const Block &pb = *pbit->second;
+                size_t p_end = pb.stmts.size();
+                if (p_end > 0 && (pb.stmts.back()->kind == StmtKind::Goto ||
+                                  pb.stmts.back()->kind == StmtKind::Branch)) {
+                    --p_end;
+                }
+                ScanRes pr = scan_block_tail(pb, p_end, ep_scan.clobbered, true);
+                if (pr.ctype == "void") { all_preds_ok = false; break; }
+                pred_cands.push_back(std::move(pr));
+            }
+            if (all_preds_ok && !pred_cands.empty()) {
+                bool all_bc_fam = true, any_c_only = false, all_bc_fit_u8 = true;
+                bool all_ax_fam = true, any_a_only = false, all_ax_zero = true;
+                for (const auto &pc : pred_cands) {
+                    if (pc.creg != "bc" && pc.creg != "c") all_bc_fam = false;
+                    if (pc.creg == "c") any_c_only = true;
+                    if (pc.creg == "bc" && (!pc.cexpr || pc.cexpr->kind != ExprKind::Const || pc.cexpr->value > 0xFFu)) {
+                        all_bc_fit_u8 = false;
+                    }
+                    if (pc.creg != "ax" && pc.creg != "a") all_ax_fam = false;
+                    if (pc.creg == "a") any_a_only = true;
+                    if (pc.creg == "ax" && (!pc.cexpr || pc.cexpr->kind != ExprKind::Const || pc.cexpr->value != 0u)) {
+                        all_ax_zero = false;
+                    }
+                }
+                std::string r0 = pred_cands[0].creg;
+                std::string t0 = pred_cands[0].ctype;
+                bool same = true;
+                if (all_bc_fam && any_c_only) {
+                    if (all_bc_fit_u8) { r0 = "c"; t0 = "uint8_t"; }
+                    else               { r0 = "bc"; t0 = "uint16_t"; }
+                } else if (all_ax_fam && any_a_only) {
+                    if (all_ax_zero) { r0 = "a"; t0 = "uint8_t"; }
+                    else             { r0 = "ax"; t0 = "uint16_t"; }
+                } else {
+                    for (const auto &pc : pred_cands) {
+                        if (pc.creg != r0) { same = false; break; }
+                    }
+                }
+                if (same) {
+                    Width rw = (r0 == "de:bc") ? Width::D : ((r0 == "ax" || r0 == "bc" || r0 == "de") ? Width::W : Width::B);
+                    ExprPtr ce = (r0 == "de:bc") ? consolidate_pair(Expr::make_reg("bc"), Expr::make_reg("de"))
+                                                 : Expr::make_reg(r0, rw);
+                    exit_info.push_back({b, t0, ce, r0});
+                    matched_blocks.insert(b->start);
+                }
+            }
+        }
+    }
+
+    // Harmonize compatible subregister/pair candidates without truncating genuine 16-bit returns!
+    if (exit_info.size() > 1) {
+        bool all_bc_family = true, any_c_byte = false, all_bc_fit_u8 = true;
+        bool all_ax_family = true, any_a_byte = false, all_ax_zero = true;
+        for (const auto &c : exit_info) {
+            if (c.creg != "bc" && c.creg != "c") all_bc_family = false;
+            if (c.creg == "c") any_c_byte = true;
+            if (c.creg == "bc" && (!c.cexpr || c.cexpr->kind != ExprKind::Const || c.cexpr->value > 0xFFu)) {
+                all_bc_fit_u8 = false;
+            }
+            if (c.creg != "ax" && c.creg != "a") all_ax_family = false;
+            if (c.creg == "a") any_a_byte = true;
+            if (c.creg == "ax" && (!c.cexpr || c.cexpr->kind != ExprKind::Const || c.cexpr->value != 0u)) {
+                all_ax_zero = false;
+            }
+        }
+        if (all_bc_family && any_c_byte) {
+            if (all_bc_fit_u8) {
+                for (auto &c : exit_info) {
+                    if (c.creg == "bc") {
+                        c.creg = "c";
+                        c.ctype = "uint8_t";
+                        c.cexpr = Expr::make_const(c.cexpr->value & 0xFFu, Width::B);
+                    }
+                }
+            } else {
+                for (auto &c : exit_info) {
+                    if (c.creg == "c") {
+                        c.creg = "bc";
+                        c.ctype = "uint16_t";
+                        c.cexpr = Expr::make_reg("bc", Width::W);
+                    }
+                }
+            }
+        } else if (all_ax_family && any_a_byte) {
+            if (all_ax_zero) {
+                for (auto &c : exit_info) {
+                    if (c.creg == "ax") {
+                        c.creg = "a";
+                        c.ctype = "uint8_t";
+                        c.cexpr = Expr::make_const(0, Width::B);
+                    }
+                }
+            } else {
+                for (auto &c : exit_info) {
+                    if (c.creg == "a") {
+                        c.creg = "ax";
+                        c.ctype = "uint16_t";
+                        c.cexpr = Expr::make_reg("ax", Width::W);
+                    }
+                }
+            }
         }
     }
 

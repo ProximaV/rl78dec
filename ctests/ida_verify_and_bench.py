@@ -323,6 +323,18 @@ if switch_ea is not None:
         sv.apply_to(scf.body, None)
         switch_visited = visitor_stats["switches"] > 0
 
+cf_conf = ida_hexrays.decompile(0xA714)
+conf_txt = str(cf_conf) if cf_conf else ""
+cf_init = ida_hexrays.decompile(0xA57A)
+init_txt = str(cf_init) if cf_init else ""
+conf_returns_ok = (
+    "uint16_t process_CONF(" in conf_txt
+    and all(f"return {{rc}};" in conf_txt for rc in range(8))
+)
+conf_no_flag_noise = ("CY =" not in conf_txt and "ZF =" not in conf_txt)
+conf_lvar_count = len(cf_conf.lvars) if cf_conf else 999
+init_captures_conf = ("= process_CONF(0)" in init_txt and "= process_CONF(1)" in init_txt)
+
 report = {{
     "proc_id": hex(proc_id),
     "proc_name": proc_name,
@@ -343,6 +355,10 @@ report = {{
     "ast_mutation_ok": ast_mutation_ok,
     "color_addr_ok": color_addr_ok,
     "netnode_ok": netnode_ok,
+    "process_conf_returns_ok": conf_returns_ok,
+    "process_conf_no_flag_noise": conf_no_flag_noise,
+    "process_conf_lvar_count": conf_lvar_count,
+    "init_configs_captures_conf": init_captures_conf,
 }}
 with open(r"{report_json.as_posix()}", "w", encoding="utf-8") as fp:
     json.dump(report, fp, indent=2)
@@ -393,6 +409,14 @@ ida_pro.qexit(0)
             failures.append("Live ctree AST mutation failed to update printed text")
         if report["switch_ea"] is not None and not report["switch_visited"]:
             failures.append("ctree_visitor_t failed to visit cit_switch node (cit_switch missing from JSON/visitor)")
+        if not report.get("process_conf_returns_ok", False):
+            failures.append("process_CONF (0xA714) missing uint16_t return or shared-epilogue BC return codes 0..7")
+        if not report.get("process_conf_no_flag_noise", False):
+            failures.append("process_CONF (0xA714) leaked redundant CY = / ZF = statements")
+        if report.get("process_conf_lvar_count", 999) > 18:
+            failures.append(f"process_CONF (0xA714) has excessive temporaries ({report.get('process_conf_lvar_count')})")
+        if not report.get("init_configs_captures_conf", False):
+            failures.append("init_configs (0xA57A) failed to capture process_CONF return values")
         if not c_ok:
             failures.append(f"Corpus C output failed cl.exe /Zs /W3 /TC ({len(c_errs)} sample errors)")
 

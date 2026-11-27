@@ -20,6 +20,8 @@ std::map<uint32_t, std::unique_ptr<Function>> build_functions(
     const std::set<uint32_t> &calls,
     const std::vector<uint32_t> &extra_entries = {});
 
+void duplicate_epilogue_returns(Function &func, const FrameInfo &fi);
+void thread_condition_jumps(Function &func, const FrameInfo &fi);
 void resolve_flags(Function &func);
 
 } // namespace rl78dec

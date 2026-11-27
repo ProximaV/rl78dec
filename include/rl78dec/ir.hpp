@@ -238,6 +238,9 @@ struct FrameInfo {
     std::vector<std::string> saved_regs;
     std::vector<std::string> homed_args;
     std::map<int64_t, std::string> homed_slot_to_arg;
+    std::map<int64_t, std::string> homed_word_slots;
+    std::vector<ExprPtr> initial_spill_stack;
+    int fp_bias = 0;
     std::vector<std::string> prologue_pushes;
     int arg_base = 4;
     bool is_isr = false;

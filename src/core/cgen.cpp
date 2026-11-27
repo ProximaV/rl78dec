@@ -467,7 +467,24 @@ struct CGenCtx {
     }
 
     int ensure_lvar(const std::string &raw, Width w, bool is_arg, bool is_stk = false, int64_t stk_off = 0) {
-        if (auto it = var_idx_map.find(raw); it != var_idx_map.end()) return it->second;
+        if (auto lit = frame_info.locals.find(raw); lit != frame_info.locals.end() &&
+            width_bytes(lit->second.width) > width_bytes(w)) {
+            w = lit->second.width;
+        }
+        if (auto ait = frame_info.args.find(raw); ait != frame_info.args.end() &&
+            width_bytes(ait->second.width) > width_bytes(w)) {
+            w = ait->second.width;
+        }
+        if (auto it = var_idx_map.find(raw); it != var_idx_map.end()) {
+            int idx = it->second;
+            auto &existing = cf->lvars[idx];
+            if (!existing.has_user_type && !var_structs.count(raw) && width_bytes(w) > existing.width) {
+                existing.width = width_bytes(w);
+                existing.type_str = var_type_of(raw, w);
+                cf->var_types[existing.name] = existing.type_str;
+            }
+            return idx;
+        }
         lvar_t lv;
         lv.index = static_cast<int>(cf->lvars.size());
         lv.canonical_name = raw;
@@ -836,15 +853,35 @@ struct CGenCtx {
                     if (opts.hide_casts && (e->op == "u8" || e->op == "u16" || e->op == "u32")) {
                         return build_cexpr(e->l, ea);
                     }
+                    cexpr_t *inner = build_cexpr(e->l, ea);
+                    std::string target_ty;
+                    if      (e->op == "u8")  target_ty = "uint8_t";
+                    else if (e->op == "u16") target_ty = "uint16_t";
+                    else if (e->op == "u32") target_ty = "uint32_t";
+                    else if (e->op == "i8")  target_ty = "int8_t";
+                    else if (e->op == "i16") target_ty = "int16_t";
+                    else                     target_ty = "int32_t";
+
+                    if ((e->op == "u8" || e->op == "u16" || e->op == "u32") && inner &&
+                        inner->type_str == target_ty) {
+                        bool exact_atom = (inner->op == cot_var || inner->op == cot_ptr ||
+                                           inner->op == cot_idx || inner->op == cot_memref ||
+                                           inner->op == cot_memptr || inner->op == cot_cast);
+                        if (inner->op == cot_obj) {
+                            auto git = cf->global_syms.find(inner->helper);
+                            if (git == cf->global_syms.end() || !git->second.is_array) exact_atom = true;
+                        }
+                        if (exact_atom) return inner;
+                    }
+
                     cexpr_t *c = cf->alloc_expr(cot_cast, ea);
-                    c->x = build_cexpr(e->l, ea);
-                    if      (e->op == "u8")  c->type_str = "uint8_t";
-                    else if (e->op == "u16") c->type_str = "uint16_t";
-                    else if (e->op == "u32") c->type_str = "uint32_t";
-                    else if (e->op == "i8")  c->type_str = "int8_t";
-                    else if (e->op == "i16") c->type_str = "int16_t";
-                    else                     c->type_str = "int32_t";
-                    c->text_cache = "(" + c->type_str + ")(" + c->x->print1(&cf->lvars) + ")";
+                    c->x = inner;
+                    c->type_str = target_ty;
+                    if (inner && !inner->type_str.empty() && inner->type_str.back() == '*') {
+                        c->text_cache = "(" + c->type_str + ")(uintptr_t)(" + inner->print1(&cf->lvars) + ")";
+                    } else {
+                        c->text_cache = "(" + c->type_str + ")(" + inner->print1(&cf->lvars) + ")";
+                    }
                     return c;
                 }
                 ctype_t op = cot_neg;
@@ -1239,6 +1276,9 @@ struct CGenCtx {
                 ins->cexpr_node = call;
                 ins->text_cache = call->text_cache + ";";
                 return ins;
+            }
+            if (s.name == "nop" || s.name == "push" || s.name == "pop") {
+                return nullptr;
             }
             cinsn_t *ins = cf->alloc_insn(cit_expr, ea);
             cexpr_t *call = cf->alloc_expr(cot_call, ea);
@@ -1667,6 +1707,16 @@ std::string build_listing_with_decls(const IDatabaseProvider &db,
         }
     }
     if (any_globals) hdr << "\n";
+
+    bool any_protos = false;
+    std::unordered_set<std::string> emitted_protos;
+    for (const auto &cf : cfuncs) {
+        if (!cf || cf->signature_line.empty() || cf->func_name.empty()) continue;
+        if (!emitted_protos.insert(cf->func_name).second) continue;
+        hdr << cf->signature_line << ";\n";
+        any_protos = true;
+    }
+    if (any_protos) hdr << "\n";
 
     std::ostringstream body;
     for (size_t i = 0; i < blocks.size(); ++i) {

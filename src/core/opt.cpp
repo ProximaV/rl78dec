@@ -7,6 +7,7 @@
 #include <unordered_set>
 
 #include "rl78dec/sfr.hpp"
+#include "rl78dec/structure.hpp"
 
 namespace rl78dec {
 
@@ -493,6 +494,54 @@ void coalesce_block(Block &b) {
                     bool s1_has_flags = (s1->z_flag != nullptr || s1->cy_flag != nullptr);
                     bool s2_has_flags = (s2->z_flag != nullptr || s2->cy_flag != nullptr);
                     if ((is_gpr || is_var) && !(s1_has_flags && !s2_has_flags)) {
+                        // Coalesce consecutive partial-byte writes that together overwrite all 16 bits of a pair Var:
+                        //   s1: v = (v & 0x00FF) | hi_part   followed by   s2: v = (v & 0xFF00) [| lo_part]
+                        //   s1: v = (v & 0xFF00) | lo_part   followed by   s2: v = (v & 0x00FF) [| hi_part]
+                        if (is_var && !s1_has_flags && dst->width == Width::W) {
+                            auto parse_partial = [&](const ExprPtr &e, uint32_t &keep_mask_out, ExprPtr &new_part_out) -> bool {
+                                if (!e || e->kind != ExprKind::Bin) return false;
+                                if (e->op == "&" && same_lval(e->l, dst) && e->r && e->r->kind == ExprKind::Const &&
+                                    (e->r->value == 0x00FFu || e->r->value == 0xFF00u)) {
+                                    keep_mask_out = e->r->value;
+                                    new_part_out = nullptr;
+                                    return true;
+                                }
+                                if (e->op == "|" && e->l && e->l->kind == ExprKind::Bin && e->l->op == "&" &&
+                                    same_lval(e->l->l, dst) && e->l->r && e->l->r->kind == ExprKind::Const &&
+                                    (e->l->r->value == 0x00FFu || e->l->r->value == 0xFF00u)) {
+                                    keep_mask_out = e->l->r->value;
+                                    new_part_out = e->r;
+                                    return true;
+                                }
+                                return false;
+                            };
+                            uint32_t m1 = 0, m2 = 0;
+                            ExprPtr p1, p2;
+                            if (parse_partial(s1->src, m1, p1) && parse_partial(s2->src, m2, p2) &&
+                                ((m1 == 0x00FFu && m2 == 0xFF00u) || (m1 == 0xFF00u && m2 == 0x00FFu))) {
+                                auto mentions_dst = [&](const auto &self, const ExprPtr &sub) -> bool {
+                                    if (!sub) return false;
+                                    if (same_lval(sub, dst)) return true;
+                                    if (sub->kind == ExprKind::Bin) return self(self, sub->l) || self(self, sub->r);
+                                    if (sub->kind == ExprKind::Un) return self(self, sub->l);
+                                    if (sub->kind == ExprKind::Mem) return !sub->has_static_addr && self(self, sub->addr);
+                                    if (sub->kind == ExprKind::Bit) return self(self, sub->base);
+                                    return false;
+                                };
+                                if (!mentions_dst(mentions_dst, p1) && !mentions_dst(mentions_dst, p2)) {
+                                    ExprPtr full_src;
+                                    if (p1 && p2) full_src = fold_expr(Expr::make_bin("|", p1, p2, Width::W));
+                                    else if (p1)  full_src = fold_expr(p1);
+                                    else if (p2)  full_src = fold_expr(p2);
+                                    else          full_src = Expr::make_const(0, Width::W);
+                                    next_stmts.push_back(make_assign(s1->ea, dst, full_src, s2->z_flag, s2->cy_flag));
+                                    i += 2;
+                                    changed = true;
+                                    continue;
+                                }
+                            }
+                        }
+
                         auto i1 = extract_op_const(s1->src);
                         auto i2 = extract_op_const(s2->src);
                         if (i1.has_value() && i2.has_value() && same_lval(i2->base, dst)) {
@@ -541,7 +590,16 @@ void coalesce_block(Block &b) {
 
 ExprPtr subst_reg_in_expr(const ExprPtr &e, const std::string &old_r, const std::string &new_r) {
     if (!e) return nullptr;
-    if (e->kind == ExprKind::Reg && e->name == old_r) return Expr::make_reg(new_r, e->width);
+    if (e->kind == ExprKind::Reg) {
+        if (e->name == old_r) return Expr::make_reg(new_r, e->width);
+        if (is_pair_name(old_r) && is_pair_name(new_r)) {
+            auto [old_lo, old_hi] = pair_halves(old_r);
+            auto [new_lo, new_hi] = pair_halves(new_r);
+            if (e->name == old_lo) return Expr::make_reg(new_lo, e->width);
+            if (e->name == old_hi) return Expr::make_reg(new_hi, e->width);
+        }
+        return e;
+    }
     if (e->kind == ExprKind::Bin) return Expr::make_bin(e->op, subst_reg_in_expr(e->l, old_r, new_r), subst_reg_in_expr(e->r, old_r, new_r), e->width);
     if (e->kind == ExprKind::Un) return Expr::make_un(e->op, subst_reg_in_expr(e->l, old_r, new_r), e->width);
     if (e->kind == ExprKind::Bit) return Expr::make_bit(subst_reg_in_expr(e->base, old_r, new_r), e->bit);
@@ -584,15 +642,22 @@ void eliminate_swap_sandwiches(Function &func) {
                 if (match_j.has_value()) {
                     std::string acc = (ra == "a" || ra == "ax") ? ra : ((rb == "a" || rb == "ax") ? rb : ra);
                     std::string other = (acc == ra) ? rb : ra;
+                    AtomMask other_atoms = reg_atoms_named(other);
                     bool ok = true;
                     for (size_t k = i + 1; k < *match_j; ++k) {
                         const auto &ms = stmts[k];
                         if (ms->kind == StmtKind::Assign) {
-                            if (ms->dst->kind == ExprKind::Reg && ms->dst->name == other) {
+                            if (mentions_any_atom(ms->dst, other_atoms) || mentions_any_atom(ms->src, other_atoms)) {
                                 ok = false;
                                 break;
                             }
-                        } else if (ms->kind != StmtKind::Compare) {
+                        } else if (ms->kind == StmtKind::Compare) {
+                            if ((ms->z_flag && (mentions_any_atom(ms->z_flag->a, other_atoms) || mentions_any_atom(ms->z_flag->b, other_atoms))) ||
+                                (ms->cy_flag && (mentions_any_atom(ms->cy_flag->a, other_atoms) || mentions_any_atom(ms->cy_flag->b, other_atoms)))) {
+                                ok = false;
+                                break;
+                            }
+                        } else {
                             ok = false;
                             break;
                         }
@@ -1132,6 +1197,498 @@ void optimize(Function &func, std::optional<int> default_bank, const IDatabasePr
         Env b_out;
         opt_block(*b, default_bank, &in_env, &b_out, allow_gpr_alias);
         out_envs[b->start] = std::move(b_out);
+    }
+}
+
+void eliminate_dead_and_single_use_vars(Function &func, FrameInfo &fi,
+                                        const FunctionSig &sig, const FuncUserData &ud) {
+    std::unordered_set<std::string> protected_vars;
+    for (const auto &p : sig.params) protected_vars.insert(p.name);
+    for (const auto &[nm, _] : fi.args) protected_vars.insert(nm);
+    for (const auto &[nm, _] : fi.user_renames) protected_vars.insert(nm);
+    for (const auto &[nm, _] : fi.user_types) protected_vars.insert(nm);
+    for (const auto &[nm, _] : ud.renames) protected_vars.insert(nm);
+    for (const auto &[nm, _] : ud.types) protected_vars.insert(nm);
+    for (const auto &[nm, _] : ud.lvars) protected_vars.insert(nm);
+
+    auto is_cand_var = [&](const ExprPtr &e) -> bool {
+        return e && e->kind == ExprKind::Var && !e->name.empty() && !protected_vars.count(e->name);
+    };
+
+    auto expr_has_volatile_or_side_effect = [&](const auto &self, const ExprPtr &e) -> bool {
+        if (!e) return false;
+        switch (e->kind) {
+            case ExprKind::Intr:
+                return e->name != "__tern" ||
+                       self(self, e->args.size() > 0 ? e->args[0] : nullptr) ||
+                       self(self, e->args.size() > 1 ? e->args[1] : nullptr) ||
+                       self(self, e->args.size() > 2 ? e->args[2] : nullptr);
+            case ExprKind::Mem:
+                // Hardware SFRs (0xFFF00..0xFFFF7) may have volatile read side effects; RAM/ROM do not.
+                if (e->has_static_addr && e->static_addr >= 0xFFF00u && e->static_addr < 0xFFFF8u) return true;
+                return !e->has_static_addr && self(self, e->addr);
+            case ExprKind::Bin:
+                return self(self, e->l) || self(self, e->r);
+            case ExprKind::Un:
+                return self(self, e->l);
+            case ExprKind::Bit:
+                return self(self, e->base);
+            default:
+                return false;
+        }
+    };
+
+    auto expr_contains_mem = [&](const auto &self, const ExprPtr &e) -> bool {
+        if (!e) return false;
+        if (e->kind == ExprKind::Mem) return true;
+        if (e->kind == ExprKind::Bin) return self(self, e->l) || self(self, e->r);
+        if (e->kind == ExprKind::Un)  return self(self, e->l);
+        if (e->kind == ExprKind::Bit) return self(self, e->base);
+        if (e->kind == ExprKind::Intr) {
+            for (const auto &a : e->args) if (self(self, a)) return true;
+        }
+        return false;
+    };
+
+    auto collect_var_counts = [&](const auto &self, const ExprPtr &e,
+                                  std::unordered_map<std::string, int> &counts) -> void {
+        if (!e) return;
+        switch (e->kind) {
+            case ExprKind::Var:
+                counts[e->name] += 1;
+                break;
+            case ExprKind::Bin:
+                self(self, e->l, counts);
+                self(self, e->r, counts);
+                break;
+            case ExprKind::Un:
+                self(self, e->l, counts);
+                break;
+            case ExprKind::Mem:
+                if (!e->has_static_addr) self(self, e->addr, counts);
+                break;
+            case ExprKind::Bit:
+                self(self, e->base, counts);
+                break;
+            case ExprKind::Intr:
+                for (const auto &a : e->args) self(self, a, counts);
+                break;
+            default:
+                break;
+        }
+    };
+
+    auto collect_deps = [&](const auto &self, const ExprPtr &e,
+                            std::unordered_set<std::string> &var_deps,
+                            AtomMask &reg_deps) -> void {
+        if (!e) return;
+        switch (e->kind) {
+            case ExprKind::Var:
+            case ExprKind::StackVar:
+                var_deps.insert(e->name);
+                break;
+            case ExprKind::Reg:
+                reg_deps |= reg_atoms_named(e->name);
+                break;
+            case ExprKind::Mem:
+                if (e->es) reg_deps |= atom::ES;
+                if (!e->has_static_addr) self(self, e->addr, var_deps, reg_deps);
+                break;
+            case ExprKind::Bin:
+                self(self, e->l, var_deps, reg_deps);
+                self(self, e->r, var_deps, reg_deps);
+                break;
+            case ExprKind::Un:
+                self(self, e->l, var_deps, reg_deps);
+                break;
+            case ExprKind::Bit:
+                self(self, e->base, var_deps, reg_deps);
+                break;
+            case ExprKind::Intr:
+                for (const auto &a : e->args) self(self, a, var_deps, reg_deps);
+                break;
+            default:
+                break;
+        }
+    };
+
+    auto replace_var = [&](const auto &self, const ExprPtr &e,
+                           const std::string &target_nm, const ExprPtr &repl) -> ExprPtr {
+        if (!e) return nullptr;
+        switch (e->kind) {
+            case ExprKind::Var:
+                if (e->name == target_nm) return expr_clone(repl);
+                return e;
+            case ExprKind::Bin: {
+                ExprPtr nl = self(self, e->l, target_nm, repl);
+                ExprPtr nr = self(self, e->r, target_nm, repl);
+                if (nl == e->l && nr == e->r) return e;
+                return fold_expr(Expr::make_bin(e->op, nl, nr, e->width));
+            }
+            case ExprKind::Un: {
+                ExprPtr nl = self(self, e->l, target_nm, repl);
+                if (nl == e->l) return e;
+                return fold_expr(Expr::make_un(e->op, nl, e->width));
+            }
+            case ExprKind::Mem: {
+                if (e->has_static_addr) return e;
+                ExprPtr na = self(self, e->addr, target_nm, repl);
+                if (na == e->addr) return e;
+                return fold_expr(Expr::make_mem_addr(na, e->width, e->es, e->name, e->addr_is_linear));
+            }
+            case ExprKind::Bit: {
+                ExprPtr nb = self(self, e->base, target_nm, repl);
+                if (nb == e->base) return e;
+                return fold_expr(Expr::make_bit(nb, e->bit));
+            }
+            case ExprKind::Intr: {
+                std::vector<ExprPtr> na;
+                bool chg = false;
+                for (const auto &a : e->args) {
+                    ExprPtr x = self(self, a, target_nm, repl);
+                    if (x != a) chg = true;
+                    na.push_back(x);
+                }
+                if (!chg) return e;
+                return Expr::make_intr(e->name, std::move(na), e->width);
+            }
+            default:
+                return e;
+        }
+    };
+
+    auto wrap_for_var_width = [](const ExprPtr &rhs, Width vw) -> ExprPtr {
+        if (!rhs) return nullptr;
+        if (rhs->kind == ExprKind::Const) {
+            uint32_t m = (vw == Width::B) ? 0xFFu : ((vw == Width::W) ? 0xFFFFu : 0xFFFFFFFFu);
+            return Expr::make_const(rhs->value & m, vw, rhs->name);
+        }
+        if ((rhs->kind == ExprKind::Var || rhs->kind == ExprKind::StackVar || rhs->kind == ExprKind::Mem) &&
+            rhs->width == vw) {
+            return rhs;
+        }
+        const char *uop = (vw == Width::B) ? "u8" : ((vw == Width::W) ? "u16" : "u32");
+        if (rhs->kind == ExprKind::Un && rhs->op == uop) return rhs;
+        return fold_expr(Expr::make_un(uop, rhs, vw));
+    };
+
+    auto collect_static_mem_ranges = [&](const auto &self, const ExprPtr &e,
+                                         std::vector<std::pair<uint32_t, uint32_t>> &ranges,
+                                         bool &has_dyn_mem) -> void {
+        if (!e) return;
+        switch (e->kind) {
+            case ExprKind::Mem:
+                if (e->has_static_addr && !e->es) {
+                    ranges.emplace_back(e->static_addr, e->static_addr + static_cast<uint32_t>(width_bytes(e->width)));
+                } else {
+                    has_dyn_mem = true;
+                    if (!e->has_static_addr) self(self, e->addr, ranges, has_dyn_mem);
+                }
+                break;
+            case ExprKind::Bin:
+                self(self, e->l, ranges, has_dyn_mem);
+                self(self, e->r, ranges, has_dyn_mem);
+                break;
+            case ExprKind::Un:
+                self(self, e->l, ranges, has_dyn_mem);
+                break;
+            case ExprKind::Bit:
+                self(self, e->base, ranges, has_dyn_mem);
+                break;
+            case ExprKind::Intr:
+                for (const auto &a : e->args) self(self, a, ranges, has_dyn_mem);
+                break;
+            default:
+                break;
+        }
+    };
+
+    auto order = func.ordered();
+    for (int pass = 0; pass < 128; ++pass) {
+        bool changed = false;
+
+        // Step A: Dead-variable elimination (including dead self-increment webs like `v1 = v0; v1 = v1 + 1;`)
+        std::unordered_map<std::string, int> ext_reads;
+        std::unordered_set<std::string> non_assign_defs;
+        for (const auto &b : order) {
+            for (const auto &s : b->stmts) {
+                if (!s || s->kind == StmtKind::Nop || s->kind == StmtKind::Compare || fi.hidden_stmts.count(s->id)) {
+                    continue;
+                }
+                if (s->kind == StmtKind::Assign) {
+                    std::unordered_map<std::string, int> tmp;
+                    collect_var_counts(collect_var_counts, s->src, tmp);
+                    std::string self_dst;
+                    if (s->dst && s->dst->kind == ExprKind::Var) {
+                        self_dst = s->dst->name;
+                    } else if (s->dst) {
+                        collect_var_counts(collect_var_counts, s->dst, tmp);
+                    }
+                    for (const auto &[nm, cnt] : tmp) {
+                        if (nm != self_dst) ext_reads[nm] += cnt;
+                    }
+                } else if (s->kind == StmtKind::Branch) {
+                    ExprPtr ce = cond_expr(*s);
+                    collect_var_counts(collect_var_counts, ce, ext_reads);
+                    if (s->btclr_clear && s->bittest_expr) {
+                        collect_var_counts(collect_var_counts, s->bittest_expr, ext_reads);
+                    }
+                } else if (s->kind == StmtKind::Call) {
+                    if (s->dst && s->dst->kind == ExprKind::Var) non_assign_defs.insert(s->dst->name);
+                    collect_var_counts(collect_var_counts, s->expr, ext_reads);
+                    for (const auto &a : s->args) collect_var_counts(collect_var_counts, a, ext_reads);
+                } else if (s->kind == StmtKind::Ret) {
+                    collect_var_counts(collect_var_counts, s->val, ext_reads);
+                } else if (s->kind == StmtKind::Switch) {
+                    collect_var_counts(collect_var_counts, s->expr, ext_reads);
+                } else if (s->kind == StmtKind::Swap) {
+                    if (s->a && s->a->kind == ExprKind::Var) non_assign_defs.insert(s->a->name);
+                    if (s->b && s->b->kind == ExprKind::Var) non_assign_defs.insert(s->b->name);
+                    collect_var_counts(collect_var_counts, s->a, ext_reads);
+                    collect_var_counts(collect_var_counts, s->b, ext_reads);
+                } else if (s->kind == StmtKind::Intrinsic) {
+                    for (size_t ai = 0; ai < s->args.size(); ++ai) {
+                        if (is_lval_arg(s->name, ai) && s->args[ai] && s->args[ai]->kind == ExprKind::Var) {
+                            non_assign_defs.insert(s->args[ai]->name);
+                        }
+                        collect_var_counts(collect_var_counts, s->args[ai], ext_reads);
+                    }
+                }
+            }
+        }
+
+        for (const auto &b : order) {
+            for (const auto &s : b->stmts) {
+                if (!s || fi.hidden_stmts.count(s->id)) continue;
+                if (s->kind == StmtKind::Assign && is_cand_var(s->dst) &&
+                    !non_assign_defs.count(s->dst->name) &&
+                    ext_reads[s->dst->name] == 0 &&
+                    !expr_has_volatile_or_side_effect(expr_has_volatile_or_side_effect, s->src)) {
+                    s->kind = StmtKind::Nop;
+                    s->dst.reset();
+                    s->src.reset();
+                    s->z_flag.reset();
+                    s->cy_flag.reset();
+                    changed = true;
+                } else if (s->kind == StmtKind::Call && is_cand_var(s->dst) &&
+                           ext_reads[s->dst->name] == 0) {
+                    // Call return value is never read -> keep Call for side effects, drop unused dst variable!
+                    s->dst.reset();
+                    changed = true;
+                }
+            }
+        }
+
+        // Step B: Single-def, single-use same-block temporary inlining
+        struct LocInfo {
+            Block *blk = nullptr;
+            size_t idx = 0;
+            int count = 0;
+        };
+        std::unordered_map<std::string, LocInfo> defs, uses;
+        for (const auto &b : order) {
+            for (size_t i = 0; i < b->stmts.size(); ++i) {
+                const auto &s = b->stmts[i];
+                if (!s || s->kind == StmtKind::Nop || s->kind == StmtKind::Compare || fi.hidden_stmts.count(s->id)) {
+                    continue;
+                }
+                std::unordered_map<std::string, int> stmt_reads;
+                if (s->kind == StmtKind::Assign) {
+                    if (s->dst && s->dst->kind == ExprKind::Var) {
+                        auto &d = defs[s->dst->name];
+                        d.blk = b.get();
+                        d.idx = i;
+                        d.count += 1;
+                    } else if (s->dst) {
+                        collect_var_counts(collect_var_counts, s->dst, stmt_reads);
+                    }
+                    collect_var_counts(collect_var_counts, s->src, stmt_reads);
+                } else if (s->kind == StmtKind::Branch) {
+                    ExprPtr ce = cond_expr(*s);
+                    collect_var_counts(collect_var_counts, ce, stmt_reads);
+                    if (s->btclr_clear && s->bittest_expr) {
+                        collect_var_counts(collect_var_counts, s->bittest_expr, stmt_reads);
+                    }
+                } else if (s->kind == StmtKind::Call) {
+                    if (s->dst && s->dst->kind == ExprKind::Var) {
+                        auto &d = defs[s->dst->name];
+                        d.blk = b.get();
+                        d.idx = i;
+                        d.count += 1;
+                    }
+                    collect_var_counts(collect_var_counts, s->expr, stmt_reads);
+                    for (const auto &a : s->args) collect_var_counts(collect_var_counts, a, stmt_reads);
+                } else if (s->kind == StmtKind::Ret) {
+                    collect_var_counts(collect_var_counts, s->val, stmt_reads);
+                } else if (s->kind == StmtKind::Switch) {
+                    collect_var_counts(collect_var_counts, s->expr, stmt_reads);
+                } else if (s->kind == StmtKind::Swap) {
+                    if (s->a && s->a->kind == ExprKind::Var) defs[s->a->name].count += 2;
+                    if (s->b && s->b->kind == ExprKind::Var) defs[s->b->name].count += 2;
+                    collect_var_counts(collect_var_counts, s->a, stmt_reads);
+                    collect_var_counts(collect_var_counts, s->b, stmt_reads);
+                } else if (s->kind == StmtKind::Intrinsic) {
+                    for (size_t ai = 0; ai < s->args.size(); ++ai) {
+                        if (is_lval_arg(s->name, ai) && s->args[ai] && s->args[ai]->kind == ExprKind::Var) {
+                            defs[s->args[ai]->name].count += 2;
+                        }
+                        collect_var_counts(collect_var_counts, s->args[ai], stmt_reads);
+                    }
+                }
+                for (const auto &[nm, cnt] : stmt_reads) {
+                    auto &u = uses[nm];
+                    u.blk = b.get();
+                    u.idx = i;
+                    u.count += cnt;
+                }
+            }
+        }
+
+        for (const auto &[vnm, dinfo] : defs) {
+            if (dinfo.count != 1 || !dinfo.blk) continue;
+            auto uit = uses.find(vnm);
+            if (uit == uses.end() || uit->second.count != 1 || uit->second.blk != dinfo.blk) continue;
+            if (uit->second.idx <= dinfo.idx) continue;
+
+            Block &blk = *dinfo.blk;
+            StmtPtr &s_def = blk.stmts[dinfo.idx];
+            StmtPtr &s_use = blk.stmts[uit->second.idx];
+            if (!s_def || s_def->kind != StmtKind::Assign || !is_cand_var(s_def->dst) || !s_def->src) continue;
+            if (expr_has_volatile_or_side_effect(expr_has_volatile_or_side_effect, s_def->src)) continue;
+
+            // Do not inline into Swap or lvalue intrinsic arguments
+            if (s_use->kind != StmtKind::Assign && s_use->kind != StmtKind::Branch &&
+                s_use->kind != StmtKind::Ret && s_use->kind != StmtKind::Switch &&
+                s_use->kind != StmtKind::Call) {
+                continue;
+            }
+            if (s_use->kind == StmtKind::Branch && s_use->btclr_clear) continue;
+
+            bool rhs_has_mem = expr_contains_mem(expr_contains_mem, s_def->src);
+            std::vector<std::pair<uint32_t, uint32_t>> rhs_mem_ranges;
+            bool rhs_has_dyn_mem = false;
+            if (rhs_has_mem) {
+                collect_static_mem_ranges(collect_static_mem_ranges, s_def->src, rhs_mem_ranges, rhs_has_dyn_mem);
+            }
+            std::unordered_set<std::string> var_deps;
+            AtomMask reg_deps = 0;
+            collect_deps(collect_deps, s_def->src, var_deps, reg_deps);
+            if (var_deps.count(vnm)) continue;
+
+            bool hazard = false;
+            for (size_t k = dinfo.idx + 1; k < uit->second.idx; ++k) {
+                const auto &w = blk.stmts[k];
+                if (!w || w->kind == StmtKind::Nop || w->kind == StmtKind::Compare || fi.hidden_stmts.count(w->id)) {
+                    continue;
+                }
+                if (w->kind == StmtKind::Call || w->kind == StmtKind::Swap ||
+                    (w->kind == StmtKind::Intrinsic && w->name != "nop")) {
+                    hazard = true;
+                    break;
+                }
+                if (w->kind == StmtKind::Assign && w->dst) {
+                    if (w->dst->kind == ExprKind::Mem) {
+                        if (rhs_has_mem) {
+                            if (rhs_has_dyn_mem || !w->dst->has_static_addr || w->dst->es) {
+                                hazard = true;
+                                break;
+                            }
+                            uint32_t wa = w->dst->static_addr;
+                            uint32_t wb = wa + static_cast<uint32_t>(width_bytes(w->dst->width));
+                            for (const auto &[ra, rb] : rhs_mem_ranges) {
+                                if (wa < rb && ra < wb) { hazard = true; break; }
+                            }
+                            if (hazard) break;
+                        }
+                    } else if (w->dst->kind == ExprKind::Var || w->dst->kind == ExprKind::StackVar) {
+                        if (var_deps.count(w->dst->name)) { hazard = true; break; }
+                    } else if (w->dst->kind == ExprKind::Reg) {
+                        AtomMask wm = reg_atoms_named(w->dst->name);
+                        if ((wm & reg_deps) != 0) { hazard = true; break; }
+                    } else if (w->dst->kind == ExprKind::Bit && w->dst->base) {
+                        if (rhs_has_mem && w->dst->base->kind == ExprKind::Mem) { hazard = true; break; }
+                        if ((w->dst->base->kind == ExprKind::Var || w->dst->base->kind == ExprKind::StackVar) &&
+                            var_deps.count(w->dst->base->name)) { hazard = true; break; }
+                        if (w->dst->base->kind == ExprKind::Reg &&
+                            (reg_atoms_named(w->dst->base->name) & reg_deps) != 0) { hazard = true; break; }
+                    }
+                }
+            }
+            if (hazard) continue;
+
+            Width vw = s_def->dst->width;
+            bool direct_same_width_assign =
+                (s_use->kind == StmtKind::Assign && s_use->src &&
+                 s_use->src->kind == ExprKind::Var && s_use->src->name == vnm &&
+                 s_use->dst &&
+                 (s_use->dst->kind == ExprKind::Var || s_use->dst->kind == ExprKind::StackVar || s_use->dst->kind == ExprKind::Mem) &&
+                 s_use->dst->width == vw);
+            ExprPtr repl = direct_same_width_assign ? fold_expr(s_def->src) : wrap_for_var_width(s_def->src, vw);
+
+            if (s_use->kind == StmtKind::Assign) {
+                s_use->src = replace_var(replace_var, s_use->src, vnm, repl);
+                if (s_use->dst && s_use->dst->kind != ExprKind::Var && s_use->dst->kind != ExprKind::StackVar) {
+                    s_use->dst = replace_var(replace_var, s_use->dst, vnm, repl);
+                }
+            } else if (s_use->kind == StmtKind::Branch) {
+                if (s_use->has_bittest && s_use->bittest_expr) {
+                    s_use->bittest_expr = replace_var(replace_var, s_use->bittest_expr, vnm, repl);
+                }
+                auto sub_fl = [&](const FlagDefPtr &fl) {
+                    if (!fl) return;
+                    if (fl->a) fl->a = replace_var(replace_var, fl->a, vnm, repl);
+                    if (fl->b) fl->b = replace_var(replace_var, fl->b, vnm, repl);
+                    if (fl->c) fl->c = replace_var(replace_var, fl->c, vnm, repl);
+                };
+                sub_fl(s_use->z_flag);
+                sub_fl(s_use->cy_flag);
+            } else if (s_use->kind == StmtKind::Ret) {
+                s_use->val = replace_var(replace_var, s_use->val, vnm, repl);
+            } else if (s_use->kind == StmtKind::Switch) {
+                s_use->expr = replace_var(replace_var, s_use->expr, vnm, repl);
+            } else if (s_use->kind == StmtKind::Call) {
+                if (s_use->expr) s_use->expr = replace_var(replace_var, s_use->expr, vnm, repl);
+                for (auto &a : s_use->args) a = replace_var(replace_var, a, vnm, repl);
+            }
+
+            s_def->kind = StmtKind::Nop;
+            s_def->dst.reset();
+            s_def->src.reset();
+            s_def->z_flag.reset();
+            s_def->cy_flag.reset();
+            changed = true;
+            break; // Recompute fresh indices/counts after mutating block
+        }
+
+        if (!changed) break;
+    }
+
+    // Prune unused synthetic locals from fi.locals
+    std::unordered_map<std::string, int> live_vars;
+    for (const auto &b : order) {
+        for (const auto &s : b->stmts) {
+            if (!s || s->kind == StmtKind::Nop || s->kind == StmtKind::Compare || fi.hidden_stmts.count(s->id)) continue;
+            collect_var_counts(collect_var_counts, s->dst, live_vars);
+            collect_var_counts(collect_var_counts, s->src, live_vars);
+            collect_var_counts(collect_var_counts, s->a, live_vars);
+            collect_var_counts(collect_var_counts, s->b, live_vars);
+            collect_var_counts(collect_var_counts, s->expr, live_vars);
+            collect_var_counts(collect_var_counts, s->val, live_vars);
+            for (const auto &a : s->args) collect_var_counts(collect_var_counts, a, live_vars);
+            if (s->kind == StmtKind::Branch) {
+                ExprPtr ce = cond_expr(*s);
+                collect_var_counts(collect_var_counts, ce, live_vars);
+                if (s->has_bittest) collect_var_counts(collect_var_counts, s->bittest_expr, live_vars);
+            }
+        }
+    }
+    for (auto it = fi.locals.begin(); it != fi.locals.end();) {
+        if (!protected_vars.count(it->first) && live_vars[it->first] == 0 &&
+            it->second.var && it->second.var->kind == ExprKind::Var) {
+            it = fi.locals.erase(it);
+        } else {
+            ++it;
+        }
     }
 }
 

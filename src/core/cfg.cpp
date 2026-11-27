@@ -102,6 +102,10 @@ StmtPtr make_skip_branch(const std::map<uint32_t, DecodedInsn> &insns, const Dec
 bool expr_reads_cy(const ExprPtr &e) {
     if (!e) return false;
     if (e->kind == ExprKind::Reg && e->name == "cy") return true;
+    if (e->kind == ExprKind::Bit && e->base && e->base->kind == ExprKind::Reg &&
+        e->base->name == "psw" && e->bit == 0) {
+        return true;
+    }
     if (e->kind == ExprKind::Bin) return expr_reads_cy(e->l) || expr_reads_cy(e->r);
     if (e->kind == ExprKind::Un) return expr_reads_cy(e->l);
     if (e->kind == ExprKind::Mem) return !e->has_static_addr && expr_reads_cy(e->addr);
@@ -111,6 +115,84 @@ bool expr_reads_cy(const ExprPtr &e) {
     }
     return false;
 }
+
+namespace {
+
+bool expr_reads_z_or_psw6(const ExprPtr &e) {
+    if (!e) return false;
+    if (e->kind == ExprKind::Reg && e->name == "z") return true;
+    if (e->kind == ExprKind::Bit && e->base && e->base->kind == ExprKind::Reg &&
+        e->base->name == "psw" && e->bit == 6) {
+        return true;
+    }
+    if (e->kind == ExprKind::Bin) return expr_reads_z_or_psw6(e->l) || expr_reads_z_or_psw6(e->r);
+    if (e->kind == ExprKind::Un) return expr_reads_z_or_psw6(e->l);
+    if (e->kind == ExprKind::Mem) return !e->has_static_addr && expr_reads_z_or_psw6(e->addr);
+    if (e->kind == ExprKind::Bit) return expr_reads_z_or_psw6(e->base);
+    if (e->kind == ExprKind::Intr) {
+        for (const auto &a : e->args) if (expr_reads_z_or_psw6(a)) return true;
+    }
+    return false;
+}
+
+bool expr_reads_whole_psw(const ExprPtr &e) {
+    if (!e) return false;
+    if (e->kind == ExprKind::Bit && e->base && e->base->kind == ExprKind::Reg && e->base->name == "psw") {
+        return false;
+    }
+    if (e->kind == ExprKind::Reg && e->name == "psw") return true;
+    if (e->kind == ExprKind::Bin) return expr_reads_whole_psw(e->l) || expr_reads_whole_psw(e->r);
+    if (e->kind == ExprKind::Un) return expr_reads_whole_psw(e->l);
+    if (e->kind == ExprKind::Mem) return !e->has_static_addr && expr_reads_whole_psw(e->addr);
+    if (e->kind == ExprKind::Bit) return expr_reads_whole_psw(e->base);
+    if (e->kind == ExprKind::Intr) {
+        for (const auto &a : e->args) if (expr_reads_whole_psw(a)) return true;
+    }
+    return false;
+}
+
+ExprPtr rewrite_psw_flag_bits(const ExprPtr &e) {
+    if (!e) return nullptr;
+    if (e->kind == ExprKind::Bit && e->base && e->base->kind == ExprKind::Reg && e->base->name == "psw") {
+        if (e->bit == 0) return Expr::make_reg("cy", Width::B);
+        if (e->bit == 6) return Expr::make_reg("z", Width::B);
+        return e;
+    }
+    switch (e->kind) {
+        case ExprKind::Bin: {
+            ExprPtr nl = rewrite_psw_flag_bits(e->l);
+            ExprPtr nr = rewrite_psw_flag_bits(e->r);
+            return (nl == e->l && nr == e->r) ? e : Expr::make_bin(e->op, nl, nr, e->width);
+        }
+        case ExprKind::Un: {
+            ExprPtr nl = rewrite_psw_flag_bits(e->l);
+            return (nl == e->l) ? e : Expr::make_un(e->op, nl, e->width);
+        }
+        case ExprKind::Mem: {
+            if (e->has_static_addr) return e;
+            ExprPtr na = rewrite_psw_flag_bits(e->addr);
+            return (na == e->addr) ? e : Expr::make_mem_addr(na, e->width, e->es, e->name, e->addr_is_linear);
+        }
+        case ExprKind::Bit: {
+            ExprPtr nb = rewrite_psw_flag_bits(e->base);
+            return (nb == e->base) ? e : Expr::make_bit(nb, e->bit);
+        }
+        case ExprKind::Intr: {
+            std::vector<ExprPtr> na;
+            bool chg = false;
+            for (const auto &a : e->args) {
+                ExprPtr r = rewrite_psw_flag_bits(a);
+                if (r != a) chg = true;
+                na.push_back(r);
+            }
+            return chg ? Expr::make_intr(e->name, std::move(na), e->width) : e;
+        }
+        default:
+            return e;
+    }
+}
+
+} // namespace
 
 uint32_t cy_width_mask(Width w) {
     switch (w) {
@@ -127,6 +209,40 @@ ExprPtr wrap_u_cy(const ExprPtr &e, Width w) {
     if (e->kind == ExprKind::Const) return Expr::make_const(e->value & cy_width_mask(w), w, e->name);
     return Expr::make_un(w == Width::B ? "u8" : (w == Width::W ? "u16" : "u32"), expr_clone(e), w);
 }
+
+namespace {
+
+ExprPtr materialize_z_expr(const FlagDef &f) {
+    switch (f.kind) {
+        case FlagKind::Cmp:
+            return Expr::make_bin("==", wrap_u_cy(f.a, f.width), wrap_u_cy(f.b, f.width), Width::B);
+        case FlagKind::Cmps:
+            return Expr::make_bin("==", wrap_u_cy(f.a, Width::B), wrap_u_cy(f.b, Width::B), Width::B);
+        case FlagKind::Cmp0:
+        case FlagKind::Result:
+            return Expr::make_bin("==", wrap_u_cy(f.a, f.width), Expr::make_const(0, f.width), Width::B);
+        case FlagKind::Sub:
+            if (!f.c) {
+                return Expr::make_bin("==", wrap_u_cy(f.a, f.width), wrap_u_cy(f.b, f.width), Width::B);
+            } else {
+                ExprPtr diff = Expr::make_bin("-",
+                                              Expr::make_bin("-", wrap_u_cy(f.a, f.width), wrap_u_cy(f.b, f.width), f.width),
+                                              wrap_u_cy(f.c, Width::B), f.width);
+                return Expr::make_bin("==", wrap_u_cy(diff, f.width), Expr::make_const(0, f.width), Width::B);
+            }
+        case FlagKind::Add: {
+            ExprPtr sum = Expr::make_bin("+", wrap_u_cy(f.a, f.width), wrap_u_cy(f.b, f.width), f.width);
+            if (f.c) sum = Expr::make_bin("+", sum, wrap_u_cy(f.c, Width::B), f.width);
+            return Expr::make_bin("==", wrap_u_cy(sum, f.width), Expr::make_const(0, f.width), Width::B);
+        }
+        case FlagKind::Movs:
+            return Expr::make_bin("==", wrap_u_cy(f.b, Width::B), Expr::make_const(0, Width::B), Width::B);
+        default:
+            return nullptr;
+    }
+}
+
+} // namespace
 
 ExprPtr materialize_cy_expr(const FlagDef &f) {
     switch (f.kind) {
@@ -165,11 +281,218 @@ ExprPtr materialize_cy_expr(const FlagDef &f) {
     }
 }
 
+void duplicate_epilogue_returns(Function &func, const FrameInfo &fi) {
+    bool changed = true;
+    int guard = 0;
+    while (changed && guard++ < 16) {
+        changed = false;
+        std::unordered_set<uint32_t> pure_ret_blocks;
+        for (const auto &[bid, b] : func.blocks) {
+            if (bid == func.entry || b->stmts.empty()) continue;
+            const auto &last = b->stmts.back();
+            if (last->kind != StmtKind::Ret || last->ret_kind != "ret" || last->val != nullptr) continue;
+            bool all_hidden = true;
+            for (size_t i = 0; i + 1 < b->stmts.size(); ++i) {
+                const auto &s = b->stmts[i];
+                if (s->kind != StmtKind::Nop && !fi.hidden_stmts.count(s->id)) {
+                    all_hidden = false;
+                    break;
+                }
+            }
+            if (all_hidden) pure_ret_blocks.insert(bid);
+        }
+        if (pure_ret_blocks.empty()) break;
+
+        for (const auto &[bid, b] : func.blocks) {
+            if (pure_ret_blocks.count(bid) || b->succ.size() != 1) continue;
+            uint32_t tgt = b->succ[0].second;
+            if (!pure_ret_blocks.count(tgt)) continue;
+            const auto &ret_blk = func.blocks.at(tgt);
+            uint32_t ret_ea = ret_blk->stmts.back()->ea;
+            if (b->term == TermKind::Goto) {
+                if (!b->stmts.empty() && b->stmts.back()->kind == StmtKind::Goto) {
+                    ret_ea = b->stmts.back()->ea;
+                    b->stmts.back() = make_ret(ret_ea, "ret", nullptr);
+                } else {
+                    b->stmts.push_back(make_ret(ret_ea, "ret", nullptr));
+                }
+                b->term = TermKind::Ret;
+                b->succ.clear();
+                changed = true;
+            } else if (b->term == TermKind::Fall) {
+                b->stmts.push_back(make_ret(ret_ea, "ret", nullptr));
+                b->term = TermKind::Ret;
+                b->succ.clear();
+                changed = true;
+            }
+        }
+
+        if (changed) {
+            std::unordered_set<uint32_t> referenced;
+            referenced.insert(func.entry);
+            for (const auto &[bid, b] : func.blocks) {
+                for (const auto &[how, tgt] : b->succ) referenced.insert(tgt);
+            }
+            for (uint32_t rbid : pure_ret_blocks) {
+                if (!referenced.count(rbid)) func.blocks.erase(rbid);
+            }
+        }
+    }
+}
+
+void thread_condition_jumps(Function &func, const FrameInfo &fi) {
+    auto get_pure_flag_branch = [&](uint32_t bid) -> StmtPtr {
+        if (bid == func.entry) return nullptr;
+        auto it = func.blocks.find(bid);
+        if (it == func.blocks.end() || it->second->term != TermKind::Branch || it->second->stmts.empty()) {
+            return nullptr;
+        }
+        const auto &b = it->second;
+        for (size_t i = 0; i + 1 < b->stmts.size(); ++i) {
+            const auto &s = b->stmts[i];
+            if (s->kind != StmtKind::Nop && !fi.hidden_stmts.count(s->id)) return nullptr;
+        }
+        const auto &br = b->stmts.back();
+        if (br->kind != StmtKind::Branch || br->has_bittest) return nullptr;
+        if (br->cond != "z" && br->cond != "nz" && br->cond != "cy" && br->cond != "ncy") return nullptr;
+        return br;
+    };
+
+    bool any_redirected = false;
+    for (const auto &[bid, b] : func.blocks) {
+        if (b->term != TermKind::Branch || b->stmts.empty()) continue;
+        auto &brA = b->stmts.back();
+        if (brA->kind != StmtKind::Branch || brA->has_bittest) continue;
+        if (brA->cond != "z" && brA->cond != "nz" && brA->cond != "cy" && brA->cond != "ncy") continue;
+
+        uint32_t tgt = brA->branch_target;
+        if (tgt == bid) continue;
+        StmtPtr brB = get_pure_flag_branch(tgt);
+        if (!brB) continue;
+
+        bool a_is_z = (brA->cond == "z" || brA->cond == "nz");
+        bool b_is_z = (brB->cond == "z" || brB->cond == "nz");
+        if (a_is_z != b_is_z) continue;
+
+        bool b_taken = (brA->cond == brB->cond);
+        uint32_t new_tgt = b_taken ? brB->branch_target : brB->fallthrough;
+        if (new_tgt == tgt || new_tgt == bid) continue;
+
+        brA->branch_target = new_tgt;
+        if (new_tgt == brA->fallthrough) {
+            uint32_t ea = brA->ea;
+            b->stmts.back() = make_goto(ea, new_tgt);
+            b->term = TermKind::Goto;
+            b->succ = {{"jump", new_tgt}};
+        } else {
+            for (auto &edge : b->succ) {
+                if (edge.first == "cond") edge.second = new_tgt;
+            }
+        }
+        any_redirected = true;
+    }
+
+    if (any_redirected) {
+        bool pruned = true;
+        while (pruned) {
+            pruned = false;
+            std::unordered_set<uint32_t> referenced{func.entry};
+            for (const auto &[bid, b] : func.blocks) {
+                for (const auto &[how, tgt] : b->succ) referenced.insert(tgt);
+            }
+            for (auto it = func.blocks.begin(); it != func.blocks.end();) {
+                if (!referenced.count(it->first)) {
+                    it = func.blocks.erase(it);
+                    pruned = true;
+                } else {
+                    ++it;
+                }
+            }
+        }
+    }
+}
+
 void resolve_flags(Function &func) {
     struct FlagState {
         FlagDefPtr z;
         FlagDefPtr cy;
+        std::set<uint64_t> z_origins;
+        std::set<uint64_t> cy_origins;
+        bool z_uninit = false;
+        bool cy_uninit = false;
+
+        bool same_dataflow(const FlagState &o) const {
+            return z_uninit == o.z_uninit && cy_uninit == o.cy_uninit &&
+                   z_origins == o.z_origins && cy_origins == o.cy_origins;
+        }
     };
+
+    std::unordered_map<uint64_t, FlagDefPtr> z_defs, cy_defs;
+    for (const auto &[bid, b] : func.blocks) {
+        std::vector<StmtPtr> expanded;
+        expanded.reserve(b->stmts.size());
+        for (const auto &s : b->stmts) {
+            // Normalize `bt/bf psw.0` -> `bc/bnc` and `bt/bf psw.6` -> `bz/bnz`,
+            // and `set_bit/clr_bit/xor_bit` on `psw.0` (CY) / `psw.6` (ZF)
+            if (s->kind == StmtKind::Branch && s->has_bittest && s->bittest_expr &&
+                s->bittest_expr->kind == ExprKind::Bit && s->bittest_expr->base &&
+                s->bittest_expr->base->kind == ExprKind::Reg && s->bittest_expr->base->name == "psw") {
+                uint8_t bit = s->bittest_expr->bit;
+                if (!s->btclr_clear && (bit == 0 || bit == 6)) {
+                    s->has_bittest = false;
+                    s->bittest_expr = nullptr;
+                    if (bit == 0) s->cond = s->bittest_sense ? "cy" : "ncy";
+                    else          s->cond = s->bittest_sense ? "z" : "nz";
+                }
+            } else if (s->kind == StmtKind::Intrinsic && !s->args.empty() && s->args[0] &&
+                       s->args[0]->kind == ExprKind::Bit && s->args[0]->base &&
+                       s->args[0]->base->kind == ExprKind::Reg && s->args[0]->base->name == "psw" &&
+                       (s->args[0]->bit == 0 || s->args[0]->bit == 6)) {
+                bool is_cy = (s->args[0]->bit == 0);
+                std::string freg = is_cy ? "cy" : "z";
+                if (s->name == "set_bit" || s->name == "clr_bit") {
+                    uint32_t v = (s->name == "set_bit") ? 1u : 0u;
+                    FlagDefPtr zf = nullptr, cyf = nullptr;
+                    if (is_cy) {
+                        cyf = std::make_shared<FlagDef>(FlagDef{FlagKind::CarryVal, Width::B, Expr::make_const(v, Width::B)});
+                    } else {
+                        zf = std::make_shared<FlagDef>(FlagDef{FlagKind::Cmp0, Width::B, Expr::make_const(v ? 0u : 1u, Width::B)});
+                    }
+                    auto asg = make_assign(s->ea, Expr::make_reg(freg, Width::B), Expr::make_const(v, Width::B), zf, cyf);
+                    expanded.push_back(asg);
+                    continue;
+                } else if (s->name == "xor_bit") {
+                    ExprPtr inv = Expr::make_bin("^", Expr::make_reg(freg, Width::B), Expr::make_const(1, Width::B), Width::B);
+                    FlagDefPtr zf = nullptr, cyf = nullptr;
+                    if (is_cy) cyf = std::make_shared<FlagDef>(FlagDef{FlagKind::CarryVal, Width::B, expr_clone(inv)});
+                    auto asg = make_assign(s->ea, Expr::make_reg(freg, Width::B), inv, zf, cyf);
+                    expanded.push_back(asg);
+                    continue;
+                }
+            }
+            if (s->kind == StmtKind::Assign) {
+                s->src = rewrite_psw_flag_bits(s->src);
+            } else if (s->kind == StmtKind::Ret) {
+                s->val = rewrite_psw_flag_bits(s->val);
+            }
+            expanded.push_back(s);
+        }
+        b->stmts.swap(expanded);
+
+        for (const auto &s : b->stmts) {
+            if (s->kind == StmtKind::Compare || s->kind == StmtKind::Assign) {
+                if (s->z_flag && s->z_flag->kind != FlagKind::Unknown) {
+                    s->z_flag->origin_stmt_id = s->id;
+                    z_defs[s->id] = s->z_flag;
+                }
+                if (s->cy_flag && s->cy_flag->kind != FlagKind::Unknown) {
+                    s->cy_flag->origin_stmt_id = s->id;
+                    cy_defs[s->id] = s->cy_flag;
+                }
+            }
+        }
+    }
+
     std::unordered_map<uint32_t, FlagState> block_out;
     std::unordered_map<uint32_t, std::vector<uint32_t>> preds;
     for (const auto &[bid, b] : func.blocks) {
@@ -180,99 +503,173 @@ void resolve_flags(Function &func) {
 
     std::unordered_set<uint64_t> cy_producers_needed;
     std::unordered_set<uint64_t> z_producers_needed;
+    std::unordered_set<uint64_t> psw_sync_before_stmt;
 
-    auto join_in_state = [&](uint32_t b_start, bool record_multi_needed) -> FlagState {
+    auto join_in_state = [&](uint32_t b_start) -> FlagState {
         FlagState in;
+        if (b_start == func.entry) {
+            in.z_uninit = true;
+            in.cy_uninit = true;
+        }
         auto pit = preds.find(b_start);
-        if (pit == preds.end() || pit->second.empty()) return in;
-        if (pit->second.size() == 1) {
-            if (auto oit = block_out.find(pit->second[0]); oit != block_out.end()) {
-                return oit->second;
-            }
+        if (pit == preds.end() || pit->second.empty()) {
+            in.z_uninit = true;
+            in.cy_uninit = true;
             return in;
         }
-        // Multi-predecessor join: keep flag only if all predecessors share identical origin_stmt_id.
-        bool z_init = false, z_same = true;
-        FlagDefPtr z_first;
-        bool cy_init = false, cy_same = true;
-        FlagDefPtr cy_first;
+        bool any_visited = false;
         for (uint32_t p : pit->second) {
             auto oit = block_out.find(p);
-            if (oit == block_out.end()) { z_same = false; cy_same = false; continue; }
-            if (!z_init) { z_first = oit->second.z; z_init = true; }
-            else if (!oit->second.z || !z_first || oit->second.z->origin_stmt_id != z_first->origin_stmt_id) z_same = false;
-            if (!cy_init) { cy_first = oit->second.cy; cy_init = true; }
-            else if (!oit->second.cy || !cy_first || oit->second.cy->origin_stmt_id != cy_first->origin_stmt_id) cy_same = false;
+            if (oit == block_out.end()) continue;
+            any_visited = true;
+            in.z_uninit = in.z_uninit || oit->second.z_uninit;
+            in.cy_uninit = in.cy_uninit || oit->second.cy_uninit;
+            in.z_origins.insert(oit->second.z_origins.begin(), oit->second.z_origins.end());
+            in.cy_origins.insert(oit->second.cy_origins.begin(), oit->second.cy_origins.end());
         }
-        if (z_same && z_first && z_first->origin_stmt_id != 0) in.z = z_first;
-        else if (record_multi_needed) {
-            for (uint32_t p : pit->second) {
-                auto oit = block_out.find(p);
-                if (oit != block_out.end() && oit->second.z && oit->second.z->origin_stmt_id != 0) {
-                    z_producers_needed.insert(oit->second.z->origin_stmt_id);
-                }
-            }
+        if (!any_visited) {
+            in.z_uninit = true;
+            in.cy_uninit = true;
+            return in;
         }
-        if (cy_same && cy_first && cy_first->origin_stmt_id != 0) in.cy = cy_first;
-        else if (record_multi_needed) {
-            for (uint32_t p : pit->second) {
-                auto oit = block_out.find(p);
-                if (oit != block_out.end() && oit->second.cy && oit->second.cy->origin_stmt_id != 0) {
-                    cy_producers_needed.insert(oit->second.cy->origin_stmt_id);
-                }
-            }
+        if (!in.z_uninit && in.z_origins.size() == 1) {
+            uint64_t zid = *in.z_origins.begin();
+            if (auto it = z_defs.find(zid); it != z_defs.end()) in.z = it->second;
+        }
+        if (!in.cy_uninit && in.cy_origins.size() == 1) {
+            uint64_t cid = *in.cy_origins.begin();
+            if (auto it = cy_defs.find(cid); it != cy_defs.end()) in.cy = it->second;
         }
         return in;
     };
 
+    auto clear_z = [](FlagState &st) {
+        st.z = nullptr;
+        st.z_origins.clear();
+        st.z_uninit = true;
+    };
+    auto clear_cy = [](FlagState &st) {
+        st.cy = nullptr;
+        st.cy_origins.clear();
+        st.cy_uninit = true;
+    };
+
     auto scan = [&](const BlockPtr &b, FlagState cur, bool apply_to_branches) -> FlagState {
         for (const auto &s : b->stmts) {
-            // Check incoming CY read BEFORE this statement overwrites CY!
-            if (apply_to_branches && cur.cy && cur.cy->origin_stmt_id != 0) {
-                bool reads = false;
-                if (s->kind == StmtKind::Assign && expr_reads_cy(s->src)) reads = true;
-                else if (s->kind == StmtKind::Ret && expr_reads_cy(s->val)) reads = true;
-                else if (s->kind == StmtKind::Intrinsic) {
-                    for (const auto &a : s->args) if (expr_reads_cy(a)) reads = true;
+            // Check incoming CY / ZF / whole-PSW read BEFORE this statement overwrites flags!
+            if (apply_to_branches) {
+                bool reads_cy = false;
+                bool reads_z = false;
+                bool reads_psw = false;
+                if (s->kind == StmtKind::Assign) {
+                    reads_cy = expr_reads_cy(s->src);
+                    reads_z = expr_reads_z_or_psw6(s->src);
+                    reads_psw = expr_reads_whole_psw(s->src);
+                } else if (s->kind == StmtKind::Ret) {
+                    reads_cy = expr_reads_cy(s->val);
+                    reads_z = expr_reads_z_or_psw6(s->val);
+                    reads_psw = expr_reads_whole_psw(s->val);
+                } else if (s->kind == StmtKind::Intrinsic && s->name != "push") {
+                    for (const auto &a : s->args) {
+                        if (expr_reads_cy(a)) reads_cy = true;
+                        if (expr_reads_z_or_psw6(a)) reads_z = true;
+                        if (expr_reads_whole_psw(a)) reads_psw = true;
+                    }
                 }
-                if (reads) cy_producers_needed.insert(cur.cy->origin_stmt_id);
+                if (reads_psw) {
+                    reads_cy = true;
+                    reads_z = true;
+                    if (!cur.cy_origins.empty() || !cur.z_origins.empty()) {
+                        psw_sync_before_stmt.insert(s->id);
+                    }
+                }
+                if (reads_cy && !cur.cy_origins.empty()) {
+                    cy_producers_needed.insert(cur.cy_origins.begin(), cur.cy_origins.end());
+                }
+                if (reads_z && !cur.z_origins.empty()) {
+                    z_producers_needed.insert(cur.z_origins.begin(), cur.z_origins.end());
+                }
             }
 
-            if (s->kind == StmtKind::Compare) {
-                if (s->z_flag)  { s->z_flag->origin_stmt_id = s->id; cur.z = s->z_flag; }
-                if (s->cy_flag) { s->cy_flag->origin_stmt_id = s->id; cur.cy = s->cy_flag; }
-            } else if (s->kind == StmtKind::Assign) {
-                if (s->z_flag)  { s->z_flag->origin_stmt_id = s->id; cur.z = s->z_flag; }
-                if (s->cy_flag) { s->cy_flag->origin_stmt_id = s->id; cur.cy = s->cy_flag; }
+            if (s->kind == StmtKind::Compare || s->kind == StmtKind::Assign) {
+                if (s->z_flag) {
+                    if (s->z_flag->kind == FlagKind::Unknown) {
+                        clear_z(cur);
+                    } else {
+                        s->z_flag->origin_stmt_id = s->id;
+                        cur.z = s->z_flag;
+                        cur.z_origins = {s->id};
+                        cur.z_uninit = false;
+                    }
+                }
+                if (s->cy_flag) {
+                    if (s->cy_flag->kind == FlagKind::Unknown) {
+                        clear_cy(cur);
+                    } else {
+                        s->cy_flag->origin_stmt_id = s->id;
+                        cur.cy = s->cy_flag;
+                        cur.cy_origins = {s->id};
+                        cur.cy_uninit = false;
+                    }
+                }
             } else if (s->kind == StmtKind::Branch) {
                 if (!s->has_bittest && !s->cond.empty() && apply_to_branches) {
                     if (s->cond == "z" || s->cond == "nz") {
-                        s->z_flag = clone_flag(cur.z);
+                        if (cur.z) {
+                            s->z_flag = clone_flag(cur.z);
+                        } else {
+                            s->z_flag = nullptr;
+                            z_producers_needed.insert(cur.z_origins.begin(), cur.z_origins.end());
+                        }
                     } else if (s->cond == "cy" || s->cond == "ncy") {
-                        s->cy_flag = clone_flag(cur.cy);
+                        if (cur.cy) {
+                            s->cy_flag = clone_flag(cur.cy);
+                        } else {
+                            s->cy_flag = nullptr;
+                            cy_producers_needed.insert(cur.cy_origins.begin(), cur.cy_origins.end());
+                        }
                     } else {
-                        s->z_flag = clone_flag(cur.z);
-                        s->cy_flag = clone_flag(cur.cy);
+                        if (cur.z) s->z_flag = clone_flag(cur.z);
+                        else {
+                            s->z_flag = nullptr;
+                            z_producers_needed.insert(cur.z_origins.begin(), cur.z_origins.end());
+                        }
+                        if (cur.cy) s->cy_flag = clone_flag(cur.cy);
+                        else {
+                            s->cy_flag = nullptr;
+                            cy_producers_needed.insert(cur.cy_origins.begin(), cur.cy_origins.end());
+                        }
                     }
                 }
                 if (s->btclr_clear && s->bittest_expr && s->bittest_expr->kind == ExprKind::Bit &&
                     s->bittest_expr->base && s->bittest_expr->base->kind == ExprKind::Reg &&
                     s->bittest_expr->base->name == "psw") {
-                    if (s->bittest_expr->bit == 0) cur.cy = nullptr;
-                    else if (s->bittest_expr->bit == 6) cur.z = nullptr;
+                    if (s->bittest_expr->bit == 0) {
+                        if (apply_to_branches) {
+                            cy_producers_needed.insert(cur.cy_origins.begin(), cur.cy_origins.end());
+                            s->bittest_expr = Expr::make_bit(Expr::make_reg("cy", Width::B), 0);
+                        }
+                        clear_cy(cur);
+                    } else if (s->bittest_expr->bit == 6) {
+                        if (apply_to_branches) {
+                            z_producers_needed.insert(cur.z_origins.begin(), cur.z_origins.end());
+                            s->bittest_expr = Expr::make_bit(Expr::make_reg("z", Width::B), 0);
+                        }
+                        clear_z(cur);
+                    }
                 }
             } else if (s->kind == StmtKind::Call) {
-                cur.z = nullptr;
-                cur.cy = nullptr;
+                clear_z(cur);
+                clear_cy(cur);
             } else if (s->kind == StmtKind::Intrinsic) {
                 if (s->name == "pop" && !s->args.empty() &&
                     s->args[0]->kind == ExprKind::Reg && s->args[0]->name == "psw") {
-                    cur.z = nullptr;
-                    cur.cy = nullptr;
+                    clear_z(cur);
+                    clear_cy(cur);
                 } else if (s->name != "push" && s->name != "ei" && s->name != "di" &&
                            s->name != "sel" && s->name != "nop") {
-                    cur.z = nullptr;
-                    cur.cy = nullptr;
+                    clear_z(cur);
+                    clear_cy(cur);
                 }
             }
         }
@@ -280,14 +677,14 @@ void resolve_flags(Function &func) {
     };
 
     auto order = func.ordered();
-    for (int iter = 0; iter < 6; ++iter) {
+    for (int iter = 0; iter < 64; ++iter) {
         bool changed = false;
         for (const auto &b : order) {
-            FlagState in = join_in_state(b->start, false);
+            FlagState in = join_in_state(b->start);
             FlagState out = scan(b, in, false);
-            auto &prev = block_out[b->start];
-            if (prev.z.get() != out.z.get() || prev.cy.get() != out.cy.get()) {
-                prev = out;
+            auto it = block_out.find(b->start);
+            if (it == block_out.end() || !it->second.same_dataflow(out)) {
+                block_out[b->start] = std::move(out);
                 changed = true;
             }
         }
@@ -296,17 +693,35 @@ void resolve_flags(Function &func) {
 
     // Materialize cloned FlagDef snapshots onto branches now that dataflow converged.
     for (const auto &b : order) {
-        FlagState in = join_in_state(b->start, true);
+        FlagState in = join_in_state(b->start);
         (void)scan(b, in, true);
     }
 
-    // Materialize explicit `CY = <expr>;` statements without clobbering incoming CY when s itself reads CY!
-    if (!cy_producers_needed.empty() || !z_producers_needed.empty()) {
+    // Materialize explicit `CY = <expr>;` / `ZF = <expr>;` statements without clobbering pre-state!
+    {
         int cy_tmp_cnt = 0;
         for (const auto &b : order) {
             std::vector<StmtPtr> new_stmts;
             new_stmts.reserve(b->stmts.size());
             for (const auto &s : b->stmts) {
+                bool is_dead_set_cy = (s->kind == StmtKind::Assign && s->dst &&
+                                       s->dst->kind == ExprKind::Reg && s->dst->name == "cy" &&
+                                       !cy_producers_needed.count(s->id));
+                bool is_dead_set_z = (s->kind == StmtKind::Assign && s->dst &&
+                                      s->dst->kind == ExprKind::Reg && s->dst->name == "z" &&
+                                      !z_producers_needed.count(s->id));
+                if (is_dead_set_cy || is_dead_set_z) {
+                    continue;
+                }
+
+                if (psw_sync_before_stmt.count(s->id)) {
+                    ExprPtr masked = Expr::make_bin("&", Expr::make_reg("psw", Width::B), Expr::make_const(0xBEu, Width::B), Width::B);
+                    ExprPtr zbit = Expr::make_bin("<<", Expr::make_bin("&", Expr::make_reg("z", Width::B), Expr::make_const(1u, Width::B), Width::B), Expr::make_const(6u, Width::B), Width::B);
+                    ExprPtr cbit = Expr::make_bin("&", Expr::make_reg("cy", Width::B), Expr::make_const(1u, Width::B), Width::B);
+                    ExprPtr synced = Expr::make_bin("|", Expr::make_bin("|", masked, zbit, Width::B), cbit, Width::B);
+                    new_stmts.push_back(make_assign(s->ea, Expr::make_reg("psw", Width::B), synced));
+                }
+
                 bool need_cy = cy_producers_needed.count(s->id) > 0 && s->cy_flag != nullptr;
                 bool already_writes_cy = (s->kind == StmtKind::Assign && s->dst &&
                                           s->dst->kind == ExprKind::Reg && s->dst->name == "cy");
@@ -322,17 +737,29 @@ void resolve_flags(Function &func) {
                         new_stmts.push_back(make_assign(s->ea, Expr::make_reg("cy"), cy_val));
                     }
                 }
+
+                bool need_z = z_producers_needed.count(s->id) > 0 && s->z_flag != nullptr;
+                bool already_writes_z = (s->kind == StmtKind::Assign && s->dst &&
+                                         s->dst->kind == ExprKind::Reg && s->dst->name == "z");
+                StmtPtr post_z_stmt;
+                if (need_z && !already_writes_z) {
+                    ExprPtr zval = materialize_z_expr(*s->z_flag);
+                    if (zval) {
+                        if (s->z_flag->kind == FlagKind::Result) {
+                            post_z_stmt = make_assign(s->ea, Expr::make_reg("z"), zval);
+                        } else if (s->kind == StmtKind::Assign && expr_reads_z_or_psw6(s->src)) {
+                            ExprPtr tmp = Expr::make_var("_z_next_" + std::to_string(cy_tmp_cnt++), Width::B);
+                            new_stmts.push_back(make_assign(s->ea, tmp, zval));
+                            post_z_stmt = make_assign(s->ea, Expr::make_reg("z"), expr_clone(tmp));
+                        } else {
+                            new_stmts.push_back(make_assign(s->ea, Expr::make_reg("z"), zval));
+                        }
+                    }
+                }
+
                 new_stmts.push_back(s);
                 if (post_cy_stmt) new_stmts.push_back(std::move(post_cy_stmt));
-                if (z_producers_needed.count(s->id) && s->z_flag) {
-                    ExprPtr zval;
-                    if (s->z_flag->kind == FlagKind::Cmp || s->z_flag->kind == FlagKind::Sub) {
-                        zval = Expr::make_bin("==", wrap_u_cy(s->z_flag->a, s->z_flag->width), wrap_u_cy(s->z_flag->b, s->z_flag->width), Width::B);
-                    } else if (s->z_flag->a) {
-                        zval = Expr::make_bin("==", wrap_u_cy(s->z_flag->a, s->z_flag->width), Expr::make_const(0, s->z_flag->width), Width::B);
-                    }
-                    if (zval) new_stmts.push_back(make_assign(s->ea, Expr::make_reg("z"), zval));
-                }
+                if (post_z_stmt) new_stmts.push_back(std::move(post_z_stmt));
             }
             b->stmts.swap(new_stmts);
         }

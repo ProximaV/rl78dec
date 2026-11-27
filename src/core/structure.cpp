@@ -267,6 +267,19 @@ std::vector<SNodePtr> structure(const Function &func, const FrameInfo *frame_inf
         return cnt;
     };
 
+    auto is_pure_ret_block = [&](uint32_t ea) -> bool {
+        auto it = func.blocks.find(ea);
+        if (it == func.blocks.end() || it->second->term != TermKind::Ret || it->second->stmts.empty()) {
+            return false;
+        }
+        const auto &b = it->second;
+        if (b->stmts.back()->kind != StmtKind::Ret) return false;
+        for (size_t i = 0; i + 1 < b->stmts.size(); ++i) {
+            if (b->stmts[i]->kind != StmtKind::Nop && !is_hidden(b->stmts[i])) return false;
+        }
+        return true;
+    };
+
     auto emit_goto_or_jumpout = [&](uint32_t stmt_ea, uint32_t target_ea, std::vector<SNodePtr> &dst) {
         if (func.blocks.count(target_ea)) {
             auto g = make_snode(SNodeKind::Goto, stmt_ea);
@@ -333,6 +346,10 @@ std::vector<SNodePtr> structure(const Function &func, const FrameInfo *frame_inf
                     return;
                 }
                 if (!allowed.count(cur_ea) || !func.blocks.count(cur_ea) || emitted_blocks.count(cur_ea)) {
+                    if (func.blocks.count(cur_ea) && is_pure_ret_block(cur_ea)) {
+                        emit_body_stmts(func.blocks.at(cur_ea), dst, false);
+                        return;
+                    }
                     emit_goto_or_jumpout(cur_ea, cur_ea, dst);
                     return;
                 }
@@ -554,12 +571,12 @@ std::vector<SNodePtr> structure(const Function &func, const FrameInfo *frame_inf
                         };
                         collect_small(t_ea, reach_t);
                         collect_small(f_ea, reach_f);
-                        if (reach_t.count(f_ea)) merge_ea = f_ea;
-                        else if (reach_f.count(t_ea)) merge_ea = t_ea;
-                        else {
+                        if (reach_t.count(f_ea) && !is_pure_ret_block(f_ea)) merge_ea = f_ea;
+                        else if (reach_f.count(t_ea) && !is_pure_ret_block(t_ea)) merge_ea = t_ea;
+                        else if (!is_pure_ret_block(t_ea) && !is_pure_ret_block(f_ea)) {
                             uint32_t best = UINT32_MAX;
                             for (uint32_t x : reach_t) {
-                                if (reach_f.count(x) && allowed.count(x) && x < best) best = x;
+                                if (reach_f.count(x) && allowed.count(x) && !is_pure_ret_block(x) && x < best) best = x;
                             }
                             if (best != UINT32_MAX) merge_ea = best;
                         }
@@ -595,12 +612,58 @@ std::vector<SNodePtr> structure(const Function &func, const FrameInfo *frame_inf
                         continue;
                     }
 
+                    // Guard-clause flattening: if one arm is an immediate single-block return and
+                    // the other arm continues, emit `if (guard) { return ...; }` without nesting!
+                    if (!merge_ea.has_value()) {
+                        auto is_region_boundary = [&](uint32_t ea_chk) {
+                            return (stop_ea.has_value() && ea_chk == *stop_ea) ||
+                                   (loop_exit.has_value() && ea_chk == *loop_exit) ||
+                                   (loop_hdr.has_value() && ea_chk == *loop_hdr);
+                        };
+                        bool t_is_ret = !is_region_boundary(t_ea) && func.blocks.count(t_ea) &&
+                                        ((allowed.count(t_ea) && !emitted_blocks.count(t_ea) &&
+                                          func.blocks.at(t_ea)->term == TermKind::Ret) ||
+                                         is_pure_ret_block(t_ea));
+                        bool f_is_ret = !is_region_boundary(f_ea) && func.blocks.count(f_ea) &&
+                                        ((allowed.count(f_ea) && !emitted_blocks.count(f_ea) &&
+                                          func.blocks.at(f_ea)->term == TermKind::Ret) ||
+                                         is_pure_ret_block(f_ea));
+                        if (t_is_ret && !f_is_ret && allowed.count(f_ea) && !emitted_blocks.count(f_ea)) {
+                            auto ifn = make_snode(SNodeKind::If, term->ea);
+                            ifn->cond = c;
+                            attach_btclr(ifn, *term);
+                            emit_region(t_ea, allowed, stop_ea, loop_hdr, loop_exit, ifn->then_body);
+                            dst.push_back(ifn);
+                            cur_opt = f_ea;
+                            continue;
+                        }
+                        if (f_is_ret && !t_is_ret && !term->btclr_clear &&
+                            allowed.count(t_ea) && !emitted_blocks.count(t_ea)) {
+                            auto ifn = make_snode(SNodeKind::If, term->ea);
+                            ifn->cond = negate_cond(c);
+                            emit_region(f_ea, allowed, stop_ea, loop_hdr, loop_exit, ifn->then_body);
+                            dst.push_back(ifn);
+                            cur_opt = t_ea;
+                            continue;
+                        }
+                    }
+
                     // Full if-then-else up to merge_ea (or function exit)
                     auto ifn = make_snode(SNodeKind::If, term->ea);
                     ifn->cond = c;
                     attach_btclr(ifn, *term);
                     emit_region(t_ea, allowed, merge_ea.has_value() ? merge_ea : stop_ea, loop_hdr, loop_exit, ifn->then_body);
                     emit_region(f_ea, allowed, merge_ea.has_value() ? merge_ea : stop_ea, loop_hdr, loop_exit, ifn->else_body);
+                    auto has_non_label = [](const std::vector<SNodePtr> &v) {
+                        for (const auto &n : v) {
+                            if (n && n->kind != SNodeKind::Label) return true;
+                        }
+                        return false;
+                    };
+                    if (!term->btclr_clear && !has_non_label(ifn->then_body) && has_non_label(ifn->else_body)) {
+                        ifn->cond = negate_cond(ifn->cond);
+                        std::swap(ifn->then_body, ifn->else_body);
+                    }
                     dst.push_back(ifn);
                     if (merge_ea.has_value() && (!stop_ea.has_value() || *merge_ea != *stop_ea)) {
                         cur_opt = *merge_ea;
