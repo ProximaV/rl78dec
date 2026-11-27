@@ -1,4 +1,7 @@
 """
+DEPRECATED: Pure-Python `rl78dec` prototype (archived in legacy_py/).
+Use the native C++17 decompiler (`rl78dec.dll`, `rl78dec_cli.exe`, and `python_sdk/`) instead.
+
 rl78dec -- a decompiler for the Renesas RL78, targeting the PlayStation 4/Vita
 "syscon" system-controller firmware.
 
@@ -9,6 +12,15 @@ and the Kirk/Spock ``startrekdec``:
 
     decoder -> lifter -> cfg -> opt -> structure -> cgen
 """
+
+import warnings
+
+warnings.warn(
+    "The pure-Python 'rl78dec' package in legacy_py/ is deprecated and unmaintained. "
+    "Use the native C++17 rl78dec.dll, rl78dec_cli, and python_sdk/ instead.",
+    DeprecationWarning,
+    stacklevel=2,
+)
 
 from . import decoder, cfg, opt, structure, cgen, loader, frame, abi, spill, vars
 from .names import Namer

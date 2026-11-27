@@ -1,225 +1,167 @@
-# rl78dec — a Renesas RL78 Decompiler for IDA Pro
+# rl78dec — Native C++17 Renesas RL78 / 78K0R Decompiler & Scripting SDK for IDA Pro 9.5
 
-`rl78dec` is a high-fidelity decompiler for **Renesas RL78** (and 78K0R) microcontroller firmware, specifically targeting the PlayStation 4 and PlayStation Vita **syscon** (system controller) MCUs, automotive control modules, and industrial embedded systems. It functions both as an interactive **Hex-Rays-style plugin for IDA Pro 9.x / 8.x** and as a **standalone headless lifter**.
+`rl78dec` is a compiled native C++17 decompiler plugin (`rl78dec.dll`), standalone headless decompiler engine (`rl78dec_core.lib` / `rl78dec_cli.exe`), and multi-language scripting SDK (`IDAPython`, `ida_hexrays` shim, C ABI, and `IDC`) for **Renesas RL78 / 78K0R** microcontrollers (including PlayStation 4 and PlayStation Vita **syscon** firmware), built for IDA Pro 9.5+.
 
-The IDA processor module is leveraged strictly for instruction decoding (`insn_t`), while lifting, static single assignment (SSA) optimization, stack frame analysis, variable recovery, calling convention synthesis, control-flow restructuring, and C generation are entirely native:
+It pairs a zero-IDA-dependency C++17 decompiler core (`rl78dec_core.lib`) with an interactive Hex-Rays-parity pseudocode viewer (`Rl78Vdui`), incremental summary caching (`SummaryCache`), `$ rl78dec` netnode persistence, IDA Teams merge handlers (`merge.cpp`), and an RL78-gated (`PH.id == 0x8078` / `"rl78"`) `ida_hexrays` compatibility bridge (`rl78dec_hexrays_bridge.py`).
 
 ```mermaid
 flowchart LR
-    Decoder["1. Decoder (insn_t)"] --> Lifter["2. IR Lifter"]
-    Lifter --> CFG["3. CFG Builder"]
-    CFG --> Frame["4. Frame Analysis"]
-    Frame --> Spill["5. Spill Elimination"]
-    Spill --> Opt["6. Canonical Opt"]
-    Opt --> ABI["7. ABI & Far Ptr"]
-    ABI --> Vars["8. Def-Use Webs"]
-    Vars --> Struct["9. Structurer"]
-    Struct --> CGen["10. C Emitter"]
+    Decoder["1. Decoder (decoder.cpp)"] --> Lifter["2. IR Lifter (lifter.cpp)"]
+    Lifter --> CFG["3. CFG Builder (cfg.cpp)"]
+    CFG --> Frame["4. Frame Analysis (frame.cpp)"]
+    Frame --> Spill["5. Spill Elimination (spill.cpp)"]
+    Spill --> Opt["6. Canonical Opt (opt.cpp)"]
+    Opt --> ABI["7. ABI & Far Ptr (abi.cpp)"]
+    ABI --> Vars["8. Def-Use Webs (vars.cpp)"]
+    Vars --> Struct["9. Structurer (structure.cpp)"]
+    Struct --> CTree["10. ctree & C Emitter (ctree.cpp / cgen.cpp)"]
+    CTree --> ViewSDK["Native Viewer (view.cpp) & Python / C / IDC SDK"]
 ```
 
 ---
 
-## What It Produces
+## Key Capabilities & Architectural Support
 
-```c
-/*
- * Decompiled by rl78dec -- Renesas RL78 (PS4/Vita syscon).
- */
+### 1. RL78 / 78K0R ISA Coverage & Native C Lowering
+- **RL78-S1 / S2 / S3 Instruction Lifting**: Decodes and lifts 8-bit/16-bit register pairs (`A/X/AX`, `B/C/BC`, `D/E/DE`, `H/L/HL`), `RB0`–`RB3` bank selection (`SEL RBn`), hardware multiply/divide/MAC instructions (`MULU`, `MULH`, `MULHU`, `DIVHU`, `DIVWU`, `MACH`, `MACHU`), `CALLT` / `BRK`, `BTCLR`, `MOVS` / `CMPS`, variable-length `SK*` skips, and `BR AX` jump tables into structured `switch` statements.
+- **20-Bit Far Pointers, `ES:` Resolution & Native Memory References**: Tracks `ES` segment assignments and propagates 20-bit linear addresses across register/stack far pointer pairs, resolving references directly to native IDA symbols (`byte_FB3E5`, `word_FB2CE`, typed structs, and array accesses) rather than raw memory intrinsics.
+- **`saddr` & SFR Awareness**: Handles `saddr` wraparound addressing and Renesas RL78 Special Function Register (SFR) names.
+- **Multi-Register (`DE:BC`) 32-Bit Returns**: Recovers `uint32_t` return values across `DE:BC` and lowers subregister slices cleanly.
+- **Caller-Consensus ABI & Virtual Variable Recovery**: Resolves register/stack parameters, eliminates spill/reload pairs (`PUSH`/`POP`) and machine `XCH` placeholders, and recovers disjoint virtual variables (`v0`, `v1`, ...).
 
-void trigget_TXD0_interrupt(uint32_t a0, uint32_t address, uint8_t msg_length)
-{
-    uint16_t v11;
+### 2. Interactive Viewer & Hex-Rays Parity (`rl78dec - Pseudocode`)
+- **Strict Architecture Isolation (`PLUGIN_PROC | PLUGIN_MULTI`)**: Loads and hooks events strictly when `PH.id == 0x8078` or `PH.psnames[0]` starts with `"rl78"` (returning `nullptr` immediately on all non-RL78 databases so other decompilers and Hex-Rays are never affected).
+- **Exact Instruction EA Anchoring (`COLOR_ADDR`)**: Every C statement maps cleanly to its originating instruction EA for disassembly synchronization.
+- **Bidirectional Cursor Sync & History Navigation**: Live sync between `IDA View-A` and `rl78dec - Pseudocode`, clickable symbols/callees, and backward/forward navigation history (`Esc` / `Ctrl-Return`).
+- **`$ rl78dec` Netnode Persistence & IDA Teams Support**: Persists renames, variable types, prototypes, comments, number formats, inverted branches, cast visibility, and desktop dock layout in `$ rl78dec`, with 3-way merge handlers (`merge.cpp`).
 
-    if (msg_length == 0) {
-        return;
-    }
-    while (1) {
-        msg_length = msg_length - 1;
-        if ((msg_length + 1) == 0) break;
-        address = address + 1;
-        TXD0 = *((uint8_t *)address - 1);
-        do {
-        } while ((SSR00 & 0x40) != 0);
-        a0 = a0 + 1;
-        v11 = a0 - 1;
-        *v11 = TXD0;
-        continue;
-    }
-}
-
-uint16_t sub_35FB(void)
-{
-    uint32_t v0;
-    uint16_t v2;
-
-    if (isFirstInit != 0) {
-        current_state = 0;
-        sub_7A2E();
-        v0 = sub_A5EC();
-        saddr_D5 = (uint8_t)(v0 >> 16);
-        v2 = (uint16_t)v0 + 0x16;
-        tmp_seg = saddr_D5;
-        sub_3A836(v2, tmp_seg);
-        ...
-        trigget_TXD0_interrupt(0xFDF22, 0xFDFA2, 1 + 1);
-        ...
-    }
-    return 0;
-}
-```
-
----
-
-## Key Capabilities & Architectural Enhancements
-
-### 1. 20-Bit Far Pointer & Segment Consolidation
-The RL78 architecture pairs 16-bit registers with a 20-bit address space (up to 1 MB across 16 segments/banks `0x0`–`0x0F`). In Renesas C compilers (CA78K0R, CC-RL, and IAR), far pointer arguments (`void __far *` or `uint32_t`) are split into an offset and segment:
-* **Register Parameters**: 16-bit offset passed in `AX`, 4-bit segment in `BC` (or `C`).
-* **Stack Parameters**: 16-bit offset at `[SP+0]`, 16-bit segment at `[SP+2]` (pushed via `PUSH BC; PUSH DE`).
-
-`rl78dec` automatically consolidates these fragmented pairs into single 20-bit C pointer arguments:
-* **Callee Consolidation**: Inspects stack frame member pairings (`(address, segment)`, `(resp_address, resp_segment)`, `(table, table_seg)`) and dataflow dereferences through `ES`. Consolidates the pair into a single `uint32_t` parameter (`uint32_t address`, `uint32_t a0`), suppressing internal `tmp_seg = segment; es = tmp_seg;` boilerplate.
-* **Call-Site Synthesis**: Analyzes `PUSH BC` sequences preceded by `MOV C, #imm` (`0x0F`), folds adjacent push pairs, and combines them with offset registers/constants into unified 20-bit linear addresses:
-  ```c
-  // Before:
-  trigget_TXD0_interrupt(0xDF22, 0xF, 0xDFA2, 0xF, 1 + 1);
-  // After segment consolidation:
-  trigget_TXD0_interrupt(0xFDF22, 0xFDFA2, 1 + 1);
-  ```
-* **Linear Symbol Matching**: Consolidated constants resolve directly to named global symbols (`word_FDF22`, `byte_FDFA2`, `cmd_result`).
-
-### 2. Multi-Register (`DE:BC`) 32-Bit Return Conventions
-Functions returning 32-bit values or far pointers return them across register pair **`DE:BC`** (`DE` = high 16-bit segment/bank, `BC` = low 16-bit offset):
-* **Return Inference**: Callee exit basic blocks leading to `RET` are analyzed for definitions of `DE`/`E` and `BC`/`C`, inferring `uint32_t` return types and folding 32-bit constant return expressions.
-* **Call-Site Recovery**: Call sites identify calls to multi-register callees and allocate 32-bit destination registers (`ir.Reg("de:bc", width="d")`).
-* **Subregister Extraction**: Union-Find variable webs allocate `uint32_t vN` variables and synthesize clean subregister extraction expressions:
-  * Reads of `E`: `(uint8_t)(v0 >> 16)`
-  * Reads of `DE`: `(uint16_t)(v0 >> 16)`
-  * Reads of `BC`: `(uint16_t)v0`
-  * Reads of `C`: `(uint8_t)v0`
-* Eliminates uninitialized function entry variable bugs (e.g. spurious `saddr_D5 = v0;`).
-
-### 3. Hex-Rays Parity Interactive UX Engine
-The interactive decompiler window (`simplecustviewer_t`) provides a first-class, Hex-Rays-style experience inside IDA Pro:
-* **Exact Instruction EA Anchoring**: Every C statement maps to its originating instruction address (`ea_t`). Zero regex or string-heuristic line mapping.
-* **Hex-Rays Standard `Tab` Switching**:
-  * Pressing `Tab` (or `F5`) in Disassembly opens Pseudocode at the matching statement and focuses the decompiler.
-  * Pressing `Tab` in Pseudocode jumps Disassembly directly to the originating instruction address and focuses `IDA View-A`.
-* **Bidirectional Cursor Synchronization**:
-  * Caret navigation in Pseudocode updates the Disassembly cursor in real-time without stealing window focus.
-  * Moving the cursor in `IDA View-A` scrolls and positions the Pseudocode cursor without stealing Disassembly focus.
-  * Built-in re-entrancy flags (`_is_syncing`) prevent recursive event loops.
-* **Native Qt Token Occurrence Highlighting**: Placing the caret on any variable or symbol automatically highlights all occurrences across the function via `ida_kernwin.set_highlight(..., HIF_IDENTIFIER)`.
-* **Context-Aware Click-Through Navigation & History Stack**:
-  * Double-clicking or pressing `Enter` on a function call navigates to that function, pushing the caller's position `(func_ea, lineno)` to a navigation history stack.
-  * Pressing `Esc` pops the history stack and returns directly to the caller.
-  * Double-clicking global variables, SFRs, labels, and memory addresses navigates IDA to that linear address.
-* **Dual-Mode SSA IR Inspection (`I` Hotkey)**: Toggles in-place between high-level Pseudo-C and 3-address SSA IR with explicit basic block control-flow edges (predecessors/successors) and instruction addresses.
-* **Line Comments (`/` or `;`) & Cross-References (`X`)**: Attach persistent line comments directly to decompiled statements and inspect cross-references.
-* **Chooser Safety**: Keyboard actions are scoped strictly using `AST_ENABLE_FOR_WIDGET` to the custom viewer and `BWN_DISASM`, ensuring no interference with IDA's Functions window or modal choosers.
-
-### 4. Resilient Netnode & Desktop Layout Persistence
-* **Two-Tier Persistence**:
-  * **Database Netnode (`$ rl78dec`)**: User renames, type overrides, function prototypes, line comments, and active window state (`is_open`, `func_ea`, `lineno`, `col`, `mode`) are serialized into the `.idb` / `.i64` database.
-  * **Desktop Layout Manager**: Implements `get_widget_config`, `set_widget_config`, and `create_desktop_widget` hooks so decompiler tabs, splitters, and docking positions survive closing and reopening IDA databases.
-
-### 5. Native C Lowering & Idiom Elimination
-* **Machine `SWAP` / `xchg` Elimination**: Renesas compilers frequently emit `xch a, reg` instructions as temporary placeholders due to instruction set asymmetries. `rl78dec` traces register dataflow, eliminating synthetic `SWAP(a, b)` intrinsics in favor of direct variable assignments.
-* **Zero-Extension Idiom (`pair >> 8`)**: Eliminates the 8-bit right-shift truncation bug by folding `(pair >> 8)` into the direct zero-extended high atom.
-* **Native Pointer Dereferencing**: Recognizes pointer offsets (`*(ptr - 1)` or `ptr[offset]`) and direct pointer dereferences (`*ptr`, `*(uint16_t *)ptr`), eliminating synthetic `es_mem8[...]` arrays.
-* **Hardware Intrinsic Lowering**: Lowers `mulu` to `(uint16_t)a * x`, signed shifts to arithmetic casts (`(int8_t)x >> n`), and rotations to C bitwise expressions.
-
-### 6. Structured IDA Instruction Decoding & Caller Consensus
-* Decodes canonical instructions and typed operand structures (`op_t`) directly via `ida_ua.decode_insn` and `ida_idp.get_reg_name`, replacing fragile string parsing.
-* Statistical caller consensus scans call sites across the database to determine register parameters (`AX`, `BC`), correctly distinguishing homed arguments (`PUSH BC; PUSH AX; MOVW HL, SP`) from callee-saved registers.
-
-### 7. Virtual Variable Recovery & Spill Elimination
-* Grouping def-use chains via Union-Find isolates disjoint reuses of register pairs into independent virtual variables (`v0`, `v1`, ...).
-* Eliminates function body register spills (`push de ... pop ax`) and removes dead temporary variables.
-* Recovers loop induction variables and binds entry registers cleanly to parameter names.
-
-### 8. Switch Statement & Jump Table Recovery
-* Recovers in-flash 16-bit near and 32-bit far jump tables (`br ax`).
-* Pulls detached switch fragment basic blocks back into the parent function's CFG.
-* Recovers clean C `switch (...) { case ...: ... }` blocks with `break` and `return`.
-
----
-
-## Interactive Hotkeys & Shortcuts
-
-When running as an IDA Pro plugin:
-
-| Hotkey | Action | Description |
+| Shortcut | Action | Description |
 | :--- | :--- | :--- |
-| **`F5`** | Decompile / Refresh | Decompiles the function under cursor or refreshes active view |
-| **`Tab`** | Switch View | Disassembly $\leftrightarrow$ Pseudocode at exact matching instruction EA |
-| **`Enter`** | Navigate Symbol | Jumps to callee function, label, or global data address |
-| **`Esc`** | History Back | Steps backward through the navigation history stack |
-| **`I`** | Toggle SSA IR | Switches between high-level Pseudo-C and 3-address SSA IR |
-| **`N`** | Rename Identifier | Renames variable, parameter, or function (saved to IDB netnode) |
-| **`Y`** | Set Type / Prototype | Modifies variable type or function prototype (IDA type system) |
-| **`/`** or **`;`** | Line Comment | Adds or edits a persistent comment on the current statement |
-| **`X`** | Cross-References | Opens IDA's cross-references window for the symbol under cursor |
-| **`Ctrl-F5`** | Decompile Database | Decompiles all functions in database and exports to `.c` file |
+| **`F5`** | Decompile RL78 function | Open / focus pseudocode view (or refresh active view) |
+| **`Ctrl-F5`** | Decompile all RL78 functions | Decompile all functions in the database |
+| **`Ctrl-Shift-S`** | Clear `rl78dec` caches | Clear cached summaries and pseudocode objects |
+| **`N`** | Rename variable / symbol | Rename local, parameter, global, or function |
+| **`Y`** | Set C type / prototype | Set variable type or C function prototype |
+| **`/`** or **`;`** | Edit comment | Add or edit statement comment |
+| **`H`** | Hexadecimal / Decimal | Toggle hexadecimal ↔ decimal constant format |
+| **`R`** | Character constant | Toggle character literal format |
+| **`B`** | Binary literal | Toggle binary (`0b...`) literal format |
+| **`Shift--`** (`_`) | Signed / Unsigned decimal | Toggle signed ↔ unsigned decimal format |
+| **`I`** | Invert `if`/`else` branches | Invert condition and swap branches |
+| **`\`** | Hide / Show scalar casts | Toggle scalar cast display |
+| **`X`** | Jump to xrefs | Show cross-references for symbol under cursor |
+| **`G`** | Jump to address | Navigate to address or function |
+| **`Tab`** | Switch to disassembly | Jump to matching instruction in `IDA View-A` |
+| **`Esc`** / **`Ctrl-Return`** | Navigate back / forward | Step through pseudocode navigation history |
+| **`Alt-S`** | Sync cursor | Toggle live disassembly cursor synchronization |
+| **`Shift-I`** | Toggle C / IR view | Switch between C pseudocode and lifted SSA IR |
 
 ---
 
-## How to Run
+## Multi-Language Decompiler Scripting SDK
 
-### As an IDA Pro Plugin
-1. Install fail0verflow's [RL78 processor module](https://github.com/fail0verflow/rl78-ida-proc).
-2. Copy `rl78dec_plugin.py` and the `rl78dec/` directory into your IDA Pro plugins directory:
-   ```cmd
-   copy rl78dec_plugin.py "%APPDATA%\Hex-Rays\IDA Pro\plugins\"
-   xcopy /E /I rl78dec "%APPDATA%\Hex-Rays\IDA Pro\plugins\rl78dec"
-   ```
-3. Open any RL78 database (`.idb` / `.i64`) and press **`F5`** or **`Tab`** on any instruction.
+### 1. Zero-Change `ida_hexrays` Shim (`python_sdk/rl78dec_hexrays_bridge.py`)
+When an RL78 database is active, `rl78dec_hexrays_bridge.py` exposes a strictly RL78-gated proxy on `ida_hexrays` (delegating transparently to native `ida_hexrays` on all non-RL78 databases):
 
-### Headless (Command-Line)
-Decompile raw binary dumps or Sony FUPD containers without IDA:
+```python
+import ida_hexrays
 
-```bash
-# Decompile entire firmware to C listing
-python -m rl78dec syscon.bin -o syscon.c
+assert ida_hexrays.init_hexrays_plugin()
+cf = ida_hexrays.decompile(0x35FB)
+print(cf)
 
-# Decompile a single function by address
-python -m rl78dec syscon.bin --func 0x35FB
+class CallCollector(ida_hexrays.ctree_visitor_t):
+    def __init__(self):
+        super().__init__(ida_hexrays.CV_PARENTS)
+        self.calls = []
 
-# Specify custom entry points
-python -m rl78dec syscon.bin --entry 0x2000 --entry 0x48F6
+    def visit_expr(self, e):
+        if e.op == ida_hexrays.cot_call:
+            self.calls.append((e.ea, e.dstr()))
+        return 0
+
+v = CallCollector()
+v.apply_to(cf.body, None)
+```
+
+Also supports live AST mutation (`swap_branches`, `cnumber_t._value`, `cf.refresh_func_ctext()`), `vdui_t`, and `Hexrays_Hooks`.
+
+### 2. Python `rl78dec` FFI Package (`python_sdk/rl78dec/`)
+```python
+import rl78dec
+
+print(rl78dec.decompile(0x35FB))       # Plain C string
+print(rl78dec.dump(0x35FB))            # Lifted & optimized IR dump
+cf = rl78dec.cfunc(0x35FB)             # cfunc_t with ctree AST
+rl78dec.decompile_all("syscon.c")      # Batch decompile all functions
+
+rl78dec.db.set_var_rename(0x35FB, "a0", "queue")
+rl78dec.db.set_statement_cmt(0x35FB, 0x35FB, "Entry point")
+```
+
+### 3. Native C ABI (`include/rl78dec/rl78dec_c_api.h`)
+`rl78dec.dll` exports `rl78dec_abi_*` C symbols for external native consumers, including `rl78dec_abi_decompile`, `rl78dec_abi_decompile_text`, `rl78dec_abi_dump_ir`, `rl78dec_abi_decompile_all`, `rl78dec_abi_cfunc_json`, `rl78dec_abi_cfunc_mutate_item`, `rl78dec_abi_open_pseudocode`, and `$ rl78dec` annotation mutators.
+
+### 4. Built-in IDC Functions (`src/ida/idc_funcs.cpp`)
+`rl78dec.dll` registers 9 native IDC functions on RL78 databases:
+`rl78dec_version()`, `rl78dec_decompile(ea)`, `rl78dec_dump_ir(ea)`, `rl78dec_decompile_all(out_path)`, `rl78dec_open_pseudocode(ea, flags)`, `rl78dec_rename_lvar(func_ea, old_name, new_name)`, `rl78dec_set_lvar_type(func_ea, var_name, type_str)`, `rl78dec_set_proto(func_ea, proto_str)`, and `rl78dec_clear_caches()`.
+
+---
+
+## Standalone Headless CLI (`rl78dec_cli.exe`)
+
+Accepts raw RL78 flash dumps or Sony FUPD containers without requiring IDA:
+
+```powershell
+# Decompile entire firmware via vector table entries
+.\build\rl78dec_cli.exe syscon.bin -o syscon.c
+
+# Decompile specific entry point(s)
+.\build\rl78dec_cli.exe syscon.bin --ea 0x35FB
+
+# Dump lifted & optimized IR
+.\build\rl78dec_cli.exe syscon.bin --ea 0x35FB --ir
 ```
 
 ---
 
-## Test Suite
+## Building, Testing & Deploying
 
-The test suite runs headlessly without requiring an IDA installation or binary dumps:
+### Prerequisites
+- Visual Studio 2022 / 2026 x64 C++17 toolchain (`cl.exe`), CMake 3.20+, and Ninja
+- IDA Pro 9.5 SDK (`IDA_SDK_DIR` auto-detected when inside `ida-sdk/src/plugins/rl78dec`)
+- fail0verflow's [RL78 processor module](https://github.com/fail0verflow/rl78-ida-proc) installed in IDA Pro
 
-```bash
-python -m unittest tests/test_abi.py
-python -m unittest tests/test_vars.py
-python -m unittest tests/test_frame.py
-python -m unittest tests/test_spill.py
-python -m unittest tests/test_pipeline.py
-python -m unittest tests/test_interactive.py
-python -m unittest tests/test_db.py
-python -m unittest tests/test_highlight.py
-python -m unittest tests/test_regs.py
+### Build & Run C++ Unit / Differential Tests
+```powershell
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel
+.\build\rl78dec_tests.exe
 ```
 
-All 35 unit tests across 9 test suites verify:
-* Far pointer parameter consolidation and call-site argument synthesis.
-* Multi-register (`DE:BC`) dword returns and subregister extraction.
-* Abstract stack simulation, spill elimination, and loop induction recovery.
-* Exact instruction EA mapping and bidirectional line navigation.
-* In-memory and netnode state persistence.
-* Token syntax highlighting and chooser isolation.
+### Deploy to User IDA Plugins Directory (`%APPDATA%\Hex-Rays\IDA Pro\plugins`)
+```powershell
+cmake --build build --target rl78dec_deploy
+```
+This installs `rl78dec.dll`, `rl78dec_hexrays_bridge.py`, and the `rl78dec/` Python FFI package from `python_sdk/` into `%APPDATA%\Hex-Rays\IDA Pro\plugins\` (and removes any legacy `rl78dec_plugin.py`).
+
+### Headless IDA Pro 9.5 Tier 5 Corpus Verification
+Run `ctests/ida_verify_and_bench.py` against local RL78 databases (automatically copied to `%TEMP%` before opening):
+```powershell
+python ctests/ida_verify_and_bench.py --workspace . --idat "C:\Program Files\IDA Professional 9.5\idat.exe"
+```
+Validates zero-import `ida_hexrays`, `ctree_visitor_t` (`cit_switch`, live AST mutation), `Hexrays_Hooks`, `$ rl78dec` netnode persistence, `COLOR_ADDR` anchors, zero IR problems (`verify_ir=true`), zero unhandled markers, and full-corpus MSVC `cl.exe /Zs /W3 /TC` compilation across `DOL-1001-VTE-1001-00703030.i64` and `syscon-1.01.bin.i64`.
 
 ---
 
+## Legacy Python Version (Deprecated)
+
+The original pure-Python prototype (`rl78dec/`, `rl78dec_plugin.py`, and `tests/`) is **deprecated and unmaintained**, and has been archived under [`legacy_py/`](legacy_py/README.md) for historical reference only. New installations should build and deploy the native C++17 plugin (`rl78dec_deploy`) and use `rl78dec_cli.exe` / `python_sdk/`.
+
+---
 
 ## Credits & License
 
-* Built on the RL78 reverse-engineering work of **fail0verflow** (RL78 processor module, syscon loader) and **astrelsky/hedgeberg** (Ghidra SLEIGH).
-* Decompiler architecture inspired by zecoxao's **`spudec`**.
-* MIT License. No proprietary firmware is included.
+- Built on the RL78 reverse-engineering work of **fail0verflow** (RL78 processor module, syscon loader) and **astrelsky/hedgeberg** (Ghidra SLEIGH).
+- Decompiler architecture inspired by zecoxao's **`spudec`**.
+- MIT License. No proprietary firmware is included.
