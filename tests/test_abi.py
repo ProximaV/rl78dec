@@ -149,6 +149,53 @@ def test_return_inference():
     assert b4_1.stmts[-1].val is None
     assert b4_2.stmts[-1].val is None
 
+    # 5. Non-void user_proto must still infer and attach return values on exit blocks (e.g. sub_221D)
+    f5 = cfg.Func(0x221D)
+    b5_1 = cfg.Block(0x2237)
+    b5_1.stmts = [
+        ir.Assign(0x2237, ir.Reg("ax"), ir.Reg("bc")),
+        ir.Intrinsic(0x2238, "pop", [ir.Reg("hl")]),
+        ir.Intrinsic(0x2239, "pop", [ir.Reg("de")]),
+        ir.Intrinsic(0x223A, "pop", [ir.Reg("bc")]),
+        ir.Ret(0x223B),
+    ]
+    b5_2 = cfg.Block(0x223C)
+    b5_2.stmts = [
+        ir.Assign(0x223C, ir.Reg("ax"), ir.Bin("-", ir.Reg("ax"), ir.Const(1, "w"))),
+        ir.Ret(0x223D),
+    ]
+    f5.blocks[0x2237] = b5_1
+    f5.blocks[0x223C] = b5_2
+    fi5 = frame.FrameInfo(f5)
+    for s in b5_1.stmts[1:4]:
+        fi5.hidden_stmts.add(id(s))
+    sig5 = abi.analyze_calling_convention(f5, fi5, user_proto="uint16_t sub_221D(uint16_t a0)")
+    assert sig5.ret_type == "uint16_t"
+    assert isinstance(b5_1.stmts[-1].val, ir.Reg) and b5_1.stmts[-1].val.name == "ax"
+    assert isinstance(b5_2.stmts[-1].val, ir.Reg) and b5_2.stmts[-1].val.name == "ax"
+
+    # 6. Shared epilogue exit block (e.g. read_scratch / sub_36D79: predecessors set BC then jump to pop/ret)
+    f6 = cfg.Func(0x8224)
+    b6_p1 = cfg.Block(0x8230)
+    b6_p1.stmts = [ir.Assign(0x8230, ir.Reg("bc"), ir.Const(1, "w")), ir.Goto(0x8232, 0x8257)]
+    b6_p1.succ = [("jump", 0x8257)]
+    b6_p2 = cfg.Block(0x8256)
+    b6_p2.stmts = [ir.Assign(0x8256, ir.Reg("bc"), ir.Const(0, "w"))]
+    b6_p2.succ = [("fall", 0x8257)]
+    b6_epi = cfg.Block(0x8257)
+    pop_ax = ir.Intrinsic(0x8257, "pop", [ir.Reg("ax")])
+    pop_hl = ir.Intrinsic(0x8258, "pop", [ir.Reg("hl")])
+    b6_epi.stmts = [pop_ax, pop_hl, ir.Ret(0x8259)]
+    f6.blocks[0x8230] = b6_p1
+    f6.blocks[0x8256] = b6_p2
+    f6.blocks[0x8257] = b6_epi
+    fi6 = frame.FrameInfo(f6)
+    fi6.hidden_stmts.add(id(pop_ax))
+    fi6.hidden_stmts.add(id(pop_hl))
+    sig6 = abi.analyze_calling_convention(f6, fi6)
+    assert sig6.ret_type == "uint16_t"
+    assert isinstance(b6_epi.stmts[-1].val, ir.Reg) and b6_epi.stmts[-1].val.name == "bc"
+
     print("ok  test_return_inference")
 
 

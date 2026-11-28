@@ -181,7 +181,8 @@ def _fold(e):
         return ir.Un(e.op, sub)
     if isinstance(e, ir.Mem):
         return ir.Mem(_fold(e.addr) if isinstance(e.addr, ir.Expr) else e.addr,
-                      e.width, e.es, e.name)
+                      e.width, e.es, e.name,
+                      _fold(e.seg) if isinstance(e.seg, ir.Expr) else e.seg)
     if isinstance(e, ir.Bit):
         base = _fold(e.base)
         if isinstance(base, ir.Const):
@@ -202,11 +203,46 @@ def _mentions_any_atom(e, target_atoms):
     if isinstance(e, ir.Un):
         return _mentions_any_atom(e.e, target_atoms)
     if isinstance(e, ir.Mem):
-        return isinstance(e.addr, ir.Expr) and _mentions_any_atom(e.addr, target_atoms)
+        return ((isinstance(e.addr, ir.Expr) and _mentions_any_atom(e.addr, target_atoms)) or
+                (isinstance(e.seg, ir.Expr) and _mentions_any_atom(e.seg, target_atoms)))
     if isinstance(e, ir.Bit):
         return _mentions_any_atom(e.base, target_atoms)
     if isinstance(e, ir.IntrExpr):
         return any(_mentions_any_atom(a, target_atoms) for a in e.args)
+    return False
+
+
+def _mentions_var(e, var_name):
+    if isinstance(e, (ir.Var, ir.StackVar)):
+        return e.name == var_name
+    if isinstance(e, ir.Bin):
+        return _mentions_var(e.l, var_name) or _mentions_var(e.r, var_name)
+    if isinstance(e, ir.Un):
+        return _mentions_var(e.e, var_name)
+    if isinstance(e, ir.Mem):
+        return ((isinstance(e.addr, ir.Expr) and _mentions_var(e.addr, var_name)) or
+                (isinstance(e.seg, ir.Expr) and _mentions_var(e.seg, var_name)))
+    if isinstance(e, ir.Bit):
+        return _mentions_var(e.base, var_name)
+    if isinstance(e, ir.IntrExpr):
+        return any(_mentions_var(a, var_name) for a in e.args)
+    return False
+
+
+def _mentions_mem(e, target_addr=None):
+    if isinstance(e, ir.Mem):
+        if target_addr is None:
+            return True
+        raw = e.addr if isinstance(e.addr, int) else (e.addr.value if isinstance(e.addr, ir.Const) else None)
+        return raw is None or raw == target_addr
+    if isinstance(e, ir.Bin):
+        return _mentions_mem(e.l, target_addr) or _mentions_mem(e.r, target_addr)
+    if isinstance(e, ir.Un):
+        return _mentions_mem(e.e, target_addr)
+    if isinstance(e, ir.Bit):
+        return _mentions_mem(e.base, target_addr)
+    if isinstance(e, ir.IntrExpr):
+        return any(_mentions_mem(a, target_addr) for a in e.args)
     return False
 
 
@@ -218,24 +254,61 @@ class Env:
         self.var_consts = {}          # var_name (str) -> int
         self.var_copies = {}          # var_name (str) -> Expr
         self.const_names = {}         # reg_name (str) -> str
+        self.es_expr = None           # symbolic Expr last written to ES
+        self.es_fallback = None       # memory backing for ES if es_expr reg is clobbered
+        self.seg_cells = {}           # saddr scratch addr (0xFFE20..0xFFEFF) -> Expr
+        self.reg_seg_hint = {}        # byte reg -> Const/Mem/Expr hint for MOV ES, A
 
     def clear(self):
         self.atom_consts.clear()
         self.copies.clear()
         self.var_copies.clear()
         self.const_names.clear()
+        self.es_expr = None
+        self.es_fallback = None
+        self.seg_cells.clear()
+        self.reg_seg_hint.clear()
+
+    def _kill_var_seg_deps(self, name):
+        if self.es_fallback is not None and _mentions_var(self.es_fallback, name):
+            self.es_fallback = None
+        if self.es_expr is not None and _mentions_var(self.es_expr, name):
+            self.es_expr = self.es_fallback
+            self.es_fallback = None
+        for k in [k for k, v in self.seg_cells.items() if _mentions_var(v, name)]:
+            self.seg_cells.pop(k, None)
+        for k in [k for k, v in self.reg_seg_hint.items() if _mentions_var(v, name)]:
+            self.reg_seg_hint.pop(k, None)
+
+    def invalidate_mem(self, addr=None):
+        if addr is None:
+            self.seg_cells.clear()
+        else:
+            self.seg_cells.pop(addr, None)
+            for k in [k for k, v in self.seg_cells.items() if _mentions_mem(v, addr)]:
+                self.seg_cells.pop(k, None)
+        if self.es_fallback is not None and _mentions_mem(self.es_fallback, addr):
+            self.es_fallback = None
+        if self.es_expr is not None and _mentions_mem(self.es_expr, addr):
+            self.es_expr = self.es_fallback
+            self.es_fallback = None
+        for k in [k for k, v in self.reg_seg_hint.items() if _mentions_mem(v, addr)]:
+            self.reg_seg_hint.pop(k, None)
 
     def set_var_const(self, name, val):
         self.var_copies.pop(name, None)
         self.var_consts[name] = val
+        self._kill_var_seg_deps(name)
 
     def set_var_copy(self, name, expr):
         self.var_consts.pop(name, None)
         self.var_copies[name] = expr
+        self._kill_var_seg_deps(name)
 
     def kill_var(self, name):
         self.var_consts.pop(name, None)
         self.var_copies.pop(name, None)
+        self._kill_var_seg_deps(name)
 
     def set_bank(self, bank):
         if self.bank != bank:
@@ -258,6 +331,14 @@ class Env:
                        if _mentions_any_atom(v, regs.GPR_ATOMS)]
         for k in to_del_vars:
             self.var_copies.pop(k, None)
+        if self.es_fallback is not None and _mentions_any_atom(self.es_fallback, regs.GPR_ATOMS):
+            self.es_fallback = None
+        if self.es_expr is not None and _mentions_any_atom(self.es_expr, regs.GPR_ATOMS):
+            self.es_expr = self.es_fallback
+            self.es_fallback = None
+        for k in [k for k, v in self.seg_cells.items() if _mentions_any_atom(v, regs.GPR_ATOMS)]:
+            self.seg_cells.pop(k, None)
+        self.reg_seg_hint.clear()
 
     def lookup_const(self, reg_name):
         name = self.const_names.get(reg_name)
@@ -289,6 +370,20 @@ class Env:
                        if _mentions_any_atom(v, target_atoms)]
         for k in to_del_vars:
             self.var_copies.pop(k, None)
+        if "es" in target_atoms:
+            self.es_expr = None
+            self.es_fallback = None
+        else:
+            if self.es_fallback is not None and _mentions_any_atom(self.es_fallback, target_atoms):
+                self.es_fallback = None
+            if self.es_expr is not None and _mentions_any_atom(self.es_expr, target_atoms):
+                self.es_expr = self.es_fallback
+                self.es_fallback = None
+        for k in [k for k, v in self.seg_cells.items() if _mentions_any_atom(v, target_atoms)]:
+            self.seg_cells.pop(k, None)
+        for k in [k for k, v in self.reg_seg_hint.items()
+                  if bool(set(regs.atoms(k)) & target_atoms) or _mentions_any_atom(v, target_atoms)]:
+            self.reg_seg_hint.pop(k, None)
 
     def set_const(self, reg_name, val, name=None):
         self.kill(reg_name)
@@ -327,7 +422,7 @@ class Env:
             self.set_copy(b_reg, old_a_copy)
 
 
-def _subst(e, env):
+def _subst(e, env, is_lval=False):
     if isinstance(e, ir.Reg):
         c = env.lookup_const(e.name)
         if c is not None:
@@ -362,45 +457,73 @@ def _subst(e, env):
     if isinstance(e, ir.Mem):
         addr = _fold(_subst(e.addr, env)) if isinstance(e.addr, ir.Expr) else e.addr
         es = e.es
+        seg = _fold(_subst(e.seg, env)) if isinstance(e.seg, ir.Expr) else e.seg
         if es:
-            es_val = env.atom_consts.get("es")
+            es_val = None
+            c_es = env.atom_consts.get("es")
+            if c_es is not None:
+                es_val = c_es & 0xF
+                seg = None
+            elif env.es_expr is not None:
+                seg = env.es_expr
+            elif isinstance(seg, ir.Const):
+                es_val = seg.value & 0xF
+            elif isinstance(seg, int):
+                es_val = seg & 0xF
+
             if es_val is not None:
+                es_hi = (es_val & 0xF) << 16
                 if isinstance(addr, ir.Const):
-                    addr = ((es_val << 16) | (addr.value & 0xFFFF)) & 0xFFFFF
+                    addr = (es_hi | (addr.value & 0xFFFF)) & 0xFFFFF
                     es = False
+                    seg = ir.Const(0, "b") if es_val == 0 else None
                 elif isinstance(addr, int):
-                    addr = ((es_val << 16) | (addr & 0xFFFF)) & 0xFFFFF
+                    addr = (es_hi | (addr & 0xFFFF)) & 0xFFFFF
                     es = False
+                    seg = ir.Const(0, "b") if es_val == 0 else None
                 elif isinstance(addr, ir.Bin) and addr.op == "+":
-                    if isinstance(addr.l, ir.Const):
-                        addr = ir.Bin("+", ir.Const(((es_val << 16) | (addr.l.value & 0xFFFF)) & 0xFFFFF, "a"), addr.r)
+                    # Only fold ES segment into a base address (>= 0x1000 or named symbol),
+                    # never into small struct/field offsets like [de + 3] or [hl + 0xCA].
+                    if isinstance(addr.l, ir.Const) and (addr.l.value >= 0x1000 or getattr(addr.l, "name", None)):
+                        addr = ir.Bin("+", ir.Const((es_hi | (addr.l.value & 0xFFFF)) & 0xFFFFF, "a", name=getattr(addr.l, "name", None)), addr.r)
                         es = False
-                    elif isinstance(addr.r, ir.Const):
-                        addr = ir.Bin("+", addr.l, ir.Const(((es_val << 16) | (addr.r.value & 0xFFFF)) & 0xFFFFF, "a"))
+                        seg = ir.Const(0, "b") if es_val == 0 else None
+                    elif isinstance(addr.r, ir.Const) and (addr.r.value >= 0x1000 or getattr(addr.r, "name", None)):
+                        addr = ir.Bin("+", addr.l, ir.Const((es_hi | (addr.r.value & 0xFFFF)) & 0xFFFFF, "a", name=getattr(addr.r, "name", None)))
                         es = False
+                        seg = ir.Const(0, "b") if es_val == 0 else None
+                    else:
+                        seg = ir.Const(es_val & 0xF, "b")
+                else:
+                    seg = ir.Const(es_val & 0xF, "b")
         else:
-            if isinstance(addr, ir.Const):
-                v = addr.value
-                addr = ((0xF0000 | v) & 0xFFFFF) if v < 0x10000 else v
-            elif isinstance(addr, int):
-                if addr < 0x10000:
-                    addr = (0xF0000 | addr) & 0xFFFFF
-            elif isinstance(addr, ir.Bin) and addr.op == "+":
-                if isinstance(addr.l, ir.Const) and 0x8000 <= addr.l.value < 0x10000:
-                    addr = ir.Bin("+", ir.Const((0xF0000 | addr.l.value) & 0xFFFFF, "a"), addr.r)
-                elif isinstance(addr.r, ir.Const) and 0x8000 <= addr.r.value < 0x10000:
-                    addr = ir.Bin("+", addr.l, ir.Const((0xF0000 | addr.r.value) & 0xFFFFF, "a"))
+            # Only promote 16-bit near addresses into mirror segment 0xF0000 when seg is None
+            # (so resolved ES=0 ROM addresses with seg=Const(0) stay in segment 0 across passes).
+            if seg is None:
+                if isinstance(addr, ir.Const):
+                    v = addr.value
+                    addr = ((0xF0000 | v) & 0xFFFFF) if v < 0x10000 else v
+                elif isinstance(addr, int):
+                    if addr < 0x10000:
+                        addr = (0xF0000 | addr) & 0xFFFFF
+                elif isinstance(addr, ir.Bin) and addr.op == "+":
+                    if isinstance(addr.l, ir.Const) and 0x8000 <= addr.l.value < 0x10000:
+                        addr = ir.Bin("+", ir.Const((0xF0000 | addr.l.value) & 0xFFFFF, "a", name=getattr(addr.l, "name", None)), addr.r)
+                    elif isinstance(addr.r, ir.Const) and 0x8000 <= addr.r.value < 0x10000:
+                        addr = ir.Bin("+", addr.l, ir.Const((0xF0000 | addr.r.value) & 0xFFFFF, "a", name=getattr(addr.r, "name", None)))
 
         # GPR / Special reg alias check
         if not es and isinstance(addr, int):
             gpr = regs.gpr_alias(addr, e.width, env.bank)
             if gpr is not None:
-                return _subst(ir.Reg(gpr, e.width), env)
+                r = ir.Reg(gpr, e.width)
+                return r if is_lval else _subst(r, env)
             spec = regs.special_reg(addr, e.width)
             if spec is not None:
-                return _subst(ir.Reg(spec, e.width), env)
+                r = ir.Reg(spec, e.width)
+                return r if is_lval else _subst(r, env)
 
-        return ir.Mem(addr, e.width, es, e.name)
+        return ir.Mem(addr, e.width, es, e.name, seg)
 
     return e
 
@@ -425,6 +548,21 @@ def _clobber(env, s):
             env.kill("psw")
         else:
             env.kill(reg_name)
+        return
+    if s.name in ("set_bit", "clr_bit"):
+        if s.args:
+            tgt = s.args[0]
+            if isinstance(tgt, ir.Bit):
+                tgt = tgt.base
+            if isinstance(tgt, ir.Reg):
+                if tgt.name == "psw":
+                    env.set_bank(None)
+                env.kill(tgt.name)
+            elif isinstance(tgt, ir.Mem):
+                raw = tgt.addr if isinstance(tgt.addr, int) else (
+                    tgt.addr.value if isinstance(tgt.addr, ir.Const) else None
+                )
+                env.invalidate_mem(raw)
         return
     env.clear()
 
@@ -535,7 +673,8 @@ def _subst_reg(e, old_reg, new_reg):
         return ir.IntrExpr(e.name, [_subst_reg(a, old_reg, new_reg) for a in e.args])
     if isinstance(e, ir.Mem):
         addr = _subst_reg(e.addr, old_reg, new_reg) if isinstance(e.addr, ir.Expr) else e.addr
-        return ir.Mem(addr, width=e.width, es=e.es, name=e.name)
+        seg = _subst_reg(e.seg, old_reg, new_reg) if isinstance(e.seg, ir.Expr) else e.seg
+        return ir.Mem(addr, width=e.width, es=e.es, name=e.name, seg=seg)
     if isinstance(e, ir.Bit):
         return ir.Bit(_subst_reg(e.base, old_reg, new_reg), e.bit)
     return e
@@ -633,23 +772,28 @@ def _lower_swaps(func):
 def _opt_block(block, default_bank=0, initial_env=None):
     _coalesce_block(block)
     env = initial_env if initial_env is not None else Env(bank=default_bank)
+    replaced_rhs = {}
     for s in block.stmts:
         if isinstance(s, ir.Assign):
+            old_src = s.src
             s.src = _fold(_subst(s.src, env))
+            if s.src is not old_src:
+                replaced_rhs[id(old_src)] = s.src
 
             if isinstance(s.dst, ir.Mem):
-                s.dst = _subst(s.dst, env)
-                raw_addr = s.dst.addr if isinstance(s.dst.addr, int) else (
-                    s.dst.addr.value if isinstance(s.dst.addr, ir.Const) else None
-                )
-                if raw_addr is not None:
-                    gpr = regs.gpr_alias(raw_addr, s.dst.width, env.bank)
-                    if gpr is not None:
-                        s.dst = ir.Reg(gpr, s.dst.width)
-                    else:
-                        spec = regs.special_reg(raw_addr, s.dst.width)
-                        if spec is not None:
-                            s.dst = ir.Reg(spec, s.dst.width)
+                s.dst = _subst(s.dst, env, is_lval=True)
+                if isinstance(s.dst, ir.Mem):
+                    raw_addr = s.dst.addr if isinstance(s.dst.addr, int) else (
+                        s.dst.addr.value if isinstance(s.dst.addr, ir.Const) else None
+                    )
+                    if raw_addr is not None and not s.dst.es:
+                        gpr = regs.gpr_alias(raw_addr, s.dst.width, env.bank)
+                        if gpr is not None:
+                            s.dst = ir.Reg(gpr, s.dst.width)
+                        else:
+                            spec = regs.special_reg(raw_addr, s.dst.width)
+                            if spec is not None:
+                                s.dst = ir.Reg(spec, s.dst.width)
 
             if s.flag is not None:
                 if s.flag.kind == "result":
@@ -661,21 +805,100 @@ def _opt_block(block, default_bank=0, initial_env=None):
                         s.flag.b = _fold(_subst(s.flag.b, env))
 
             if isinstance(s.dst, ir.Reg):
-                if s.dst.name == "psw":
+                if s.dst.name == "es":
+                    eff = None
+                    fallback = None
+                    if isinstance(s.src, ir.Const):
+                        eff = ir.Const(s.src.value & 0xF, "b")
+                    elif isinstance(s.src, ir.Reg):
+                        c = env.lookup_const(s.src.name)
+                        if c is not None:
+                            eff = ir.Const(c.value & 0xF, "b")
+                        elif s.src.name in env.reg_seg_hint:
+                            eff = env.reg_seg_hint[s.src.name]
+                        else:
+                            eff = s.src
+                    elif isinstance(s.src, ir.Mem) and not s.src.es:
+                        src_raw = s.src.addr if isinstance(s.src.addr, int) else (
+                            s.src.addr.value if isinstance(s.src.addr, ir.Const) else None
+                        )
+                        if src_raw in env.seg_cells:
+                            eff = env.seg_cells[src_raw]
+                            if src_raw < 0xFFF00:
+                                fallback = s.src
+                        elif src_raw is not None and src_raw < 0xFFF00:
+                            eff = s.src
+                    elif isinstance(s.src, (ir.Var, ir.StackVar)):
+                        if s.src.name in env.var_consts:
+                            eff = ir.Const(env.var_consts[s.src.name] & 0xF, "b")
+                        else:
+                            eff = s.src
+
+                    if isinstance(eff, ir.Const):
+                        s.src = ir.Const(eff.value & 0xF, "b")
+                        env.set_const("es", eff.value & 0xF)
+                    else:
+                        env.kill("es")
+                        if eff is not None:
+                            env.es_expr = eff
+                            env.es_fallback = fallback
+                elif s.dst.name == "psw":
                     env.set_bank(None)
                     env.kill("psw")
-                elif isinstance(s.src, ir.Const):
-                    env.set_const(s.dst.name, s.src.value, getattr(s.src, "name", None))
-                elif isinstance(s.src, ir.Reg) and env.lookup_const(s.src.name) is not None:
-                    c = env.lookup_const(s.src.name)
-                    env.set_const(s.dst.name, c.value, getattr(c, "name", None))
-                elif isinstance(s.src, (ir.Reg, ir.Var, ir.StackVar)):
-                    if isinstance(s.src, (ir.Var, ir.StackVar)) and s.src.name in env.var_consts:
-                        env.set_const(s.dst.name, env.var_consts[s.src.name])
-                    else:
-                        env.set_copy(s.dst.name, s.src)
                 else:
-                    env.kill(s.dst.name)
+                    hint = None
+                    if s.dst.width == "b":
+                        if isinstance(s.src, ir.Mem) and not s.src.es:
+                            src_raw = s.src.addr if isinstance(s.src.addr, int) else (
+                                s.src.addr.value if isinstance(s.src.addr, ir.Const) else None
+                            )
+                            if src_raw in env.seg_cells:
+                                hint = env.seg_cells[src_raw]
+                            elif src_raw is not None and src_raw < 0xFFF00:
+                                hint = s.src
+                        elif isinstance(s.src, ir.Reg) and s.src.name in env.reg_seg_hint:
+                            hint = env.reg_seg_hint[s.src.name]
+
+                    if isinstance(s.src, ir.Const):
+                        env.set_const(s.dst.name, s.src.value, getattr(s.src, "name", None))
+                    elif isinstance(s.src, ir.Reg) and env.lookup_const(s.src.name) is not None:
+                        c = env.lookup_const(s.src.name)
+                        env.set_const(s.dst.name, c.value, getattr(c, "name", None))
+                    elif isinstance(s.src, (ir.Reg, ir.Var, ir.StackVar)):
+                        if isinstance(s.src, (ir.Var, ir.StackVar)) and s.src.name in env.var_consts:
+                            env.set_const(s.dst.name, env.var_consts[s.src.name])
+                        else:
+                            env.set_copy(s.dst.name, s.src)
+                    else:
+                        env.kill(s.dst.name)
+
+                    if hint is not None and not _mentions_any_atom(hint, set(regs.atoms(s.dst.name))):
+                        env.reg_seg_hint[s.dst.name] = hint
+            elif isinstance(s.dst, ir.Mem):
+                raw_addr = None
+                if not s.dst.es:
+                    raw_addr = s.dst.addr if isinstance(s.dst.addr, int) else (
+                        s.dst.addr.value if isinstance(s.dst.addr, ir.Const) else None
+                    )
+                seg_val_expr = None
+                if raw_addr is not None and s.dst.width == "b" and 0xFFE20 <= raw_addr <= 0xFFEFF:
+                    if isinstance(s.src, ir.Const):
+                        seg_val_expr = ir.Const(s.src.value & 0xF, "b")
+                    elif isinstance(s.src, ir.Reg) and s.src.name in env.reg_seg_hint:
+                        seg_val_expr = env.reg_seg_hint[s.src.name]
+                    elif isinstance(s.src, ir.Mem) and not s.src.es:
+                        src_raw = s.src.addr if isinstance(s.src.addr, int) else (
+                            s.src.addr.value if isinstance(s.src.addr, ir.Const) else None
+                        )
+                        if src_raw in env.seg_cells:
+                            seg_val_expr = env.seg_cells[src_raw]
+                        elif src_raw is not None and src_raw < 0xFFF00:
+                            seg_val_expr = s.src
+                    elif isinstance(s.src, (ir.Reg, ir.Var, ir.StackVar)):
+                        seg_val_expr = s.src
+                env.invalidate_mem(raw_addr)
+                if seg_val_expr is not None and raw_addr is not None and not _mentions_mem(seg_val_expr, raw_addr):
+                    env.seg_cells[raw_addr] = seg_val_expr
             elif isinstance(s.dst, (ir.StackVar, ir.Var)):
                 if isinstance(s.src, ir.Const):
                     env.set_var_const(s.dst.name, s.src.value)
@@ -701,34 +924,51 @@ def _opt_block(block, default_bank=0, initial_env=None):
                     env.kill("psw")
                 elif isinstance(s.dst.base, ir.Reg):
                     env.kill(s.dst.base.name)
+                elif isinstance(s.dst.base, ir.Mem):
+                    raw = None
+                    if not s.dst.base.es:
+                        raw = s.dst.base.addr if isinstance(s.dst.base.addr, int) else (
+                            s.dst.base.addr.value if isinstance(s.dst.base.addr, ir.Const) else None
+                        )
+                    env.invalidate_mem(raw)
 
         elif isinstance(s, ir.Swap):
             if isinstance(s.a, ir.Mem):
-                s.a = _subst(s.a, env)
-                raw_addr = s.a.addr if isinstance(s.a.addr, int) else (
-                    s.a.addr.value if isinstance(s.a.addr, ir.Const) else None
-                )
-                if raw_addr is not None:
-                    gpr = regs.gpr_alias(raw_addr, s.a.width, env.bank)
-                    if gpr is not None:
-                        s.a = ir.Reg(gpr, s.a.width)
+                s.a = _subst(s.a, env, is_lval=True)
+                if isinstance(s.a, ir.Mem):
+                    raw_addr = s.a.addr if isinstance(s.a.addr, int) else (
+                        s.a.addr.value if isinstance(s.a.addr, ir.Const) else None
+                    )
+                    if raw_addr is not None and not s.a.es:
+                        gpr = regs.gpr_alias(raw_addr, s.a.width, env.bank)
+                        if gpr is not None:
+                            s.a = ir.Reg(gpr, s.a.width)
             if isinstance(s.b, ir.Mem):
-                s.b = _subst(s.b, env)
-                raw_addr = s.b.addr if isinstance(s.b.addr, int) else (
-                    s.b.addr.value if isinstance(s.b.addr, ir.Const) else None
-                )
-                if raw_addr is not None:
-                    gpr = regs.gpr_alias(raw_addr, s.b.width, env.bank)
-                    if gpr is not None:
-                        s.b = ir.Reg(gpr, s.b.width)
+                s.b = _subst(s.b, env, is_lval=True)
+                if isinstance(s.b, ir.Mem):
+                    raw_addr = s.b.addr if isinstance(s.b.addr, int) else (
+                        s.b.addr.value if isinstance(s.b.addr, ir.Const) else None
+                    )
+                    if raw_addr is not None and not s.b.es:
+                        gpr = regs.gpr_alias(raw_addr, s.b.width, env.bank)
+                        if gpr is not None:
+                            s.b = ir.Reg(gpr, s.b.width)
 
             if isinstance(s.a, ir.Reg) and isinstance(s.b, ir.Reg):
                 env.swap(s.a.name, s.b.name)
             else:
                 if isinstance(s.a, ir.Reg):
                     env.kill(s.a.name)
+                elif isinstance(s.a, ir.Mem):
+                    raw = None if s.a.es else (s.a.addr if isinstance(s.a.addr, int) else (
+                        s.a.addr.value if isinstance(s.a.addr, ir.Const) else None))
+                    env.invalidate_mem(raw)
                 if isinstance(s.b, ir.Reg):
                     env.kill(s.b.name)
+                elif isinstance(s.b, ir.Mem):
+                    raw = None if s.b.es else (s.b.addr if isinstance(s.b.addr, int) else (
+                        s.b.addr.value if isinstance(s.b.addr, ir.Const) else None))
+                    env.invalidate_mem(raw)
 
         elif isinstance(s, ir.Compare):
             if s.flag.a is not None:
@@ -750,7 +990,9 @@ def _opt_block(block, default_bank=0, initial_env=None):
             for i, a in enumerate(s.args):
                 if i in lval_indices:
                     if isinstance(a, ir.Mem):
-                        new_args.append(_subst(a, env))
+                        new_args.append(_subst(a, env, is_lval=True))
+                    elif isinstance(a, ir.Bit) and isinstance(a.base, ir.Mem):
+                        new_args.append(ir.Bit(_subst(a.base, env, is_lval=True), a.bit))
                     else:
                         new_args.append(a)
                 else:
@@ -759,8 +1001,136 @@ def _opt_block(block, default_bank=0, initial_env=None):
             _clobber(env, s)
 
         elif isinstance(s, ir.Call):
+            if s.args and replaced_rhs:
+                s.args = [replaced_rhs.get(id(a), a) for a in s.args]
             env.clear()
     _coalesce_block(block)
+
+
+_ES_UNDEF = object()
+_ES_TOP = object()
+
+
+def _compute_block_es(func, preds):
+    """Forward dataflow analysis to compute entry ES value (Const or symbolic Expr) per block."""
+    in_es = {b_ea: _ES_UNDEF for b_ea in func.blocks}
+    out_es = {b_ea: _ES_UNDEF for b_ea in func.blocks}
+    if func.entry in in_es:
+        in_es[func.entry] = _ES_TOP
+
+    def _meet(a, b):
+        if a is _ES_UNDEF:
+            return b
+        if b is _ES_UNDEF:
+            return a
+        if a is _ES_TOP or b is _ES_TOP:
+            return _ES_TOP
+        return a if a == b else _ES_TOP
+
+    def _kill_val(cur, dst):
+        if cur is _ES_UNDEF or cur is _ES_TOP:
+            return cur
+        if isinstance(dst, ir.Reg):
+            if _mentions_any_atom(cur, set(regs.atoms(dst.name))):
+                return _ES_TOP
+        elif isinstance(dst, (ir.Var, ir.StackVar)):
+            if _mentions_var(cur, dst.name):
+                return _ES_TOP
+        elif isinstance(dst, ir.Mem):
+            raw = None if dst.es else (dst.addr if isinstance(dst.addr, int) else (
+                dst.addr.value if isinstance(dst.addr, ir.Const) else None))
+            if _mentions_mem(cur, raw):
+                return _ES_TOP
+        return cur
+
+    ordered = func.ordered()
+    changed = True
+    iterations = 0
+    while changed and iterations < 32:
+        changed = False
+        iterations += 1
+        for b in ordered:
+            if b.start == func.entry:
+                cur = _ES_TOP
+            else:
+                cur = _ES_UNDEF
+                for p_ea in preds.get(b.start, []):
+                    cur = _meet(cur, out_es.get(p_ea, _ES_UNDEF))
+            in_es[b.start] = cur
+
+            local_load = {}
+            for s in b.stmts:
+                if isinstance(s, ir.Assign):
+                    if isinstance(s.dst, ir.Reg) and s.dst.name == "es":
+                        val = s.src
+                        if isinstance(val, ir.Reg) and val.name in local_load:
+                            val = local_load[val.name]
+                        if isinstance(val, ir.Const):
+                            cur = ir.Const(val.value & 0xF, "b")
+                        elif isinstance(val, (ir.StackVar, ir.Var, ir.Reg)):
+                            cur = val
+                        elif isinstance(val, ir.Mem) and not val.es:
+                            src_raw = val.addr if isinstance(val.addr, int) else (
+                                val.addr.value if isinstance(val.addr, ir.Const) else None)
+                            cur = val if (src_raw is not None and src_raw < 0xFFF00) else _ES_TOP
+                        else:
+                            cur = _ES_TOP
+                    else:
+                        cur = _kill_val(cur, s.dst)
+                        if isinstance(s.dst, ir.Reg):
+                            tatoms = set(regs.atoms(s.dst.name))
+                            for k in [k for k, v in local_load.items()
+                                      if bool(set(regs.atoms(k)) & tatoms) or _mentions_any_atom(v, tatoms)]:
+                                local_load.pop(k, None)
+                            if s.dst.width == "b":
+                                if isinstance(s.src, ir.Const):
+                                    local_load[s.dst.name] = ir.Const(s.src.value & 0xF, "b")
+                                elif isinstance(s.src, ir.StackVar):
+                                    local_load[s.dst.name] = s.src
+                                elif isinstance(s.src, ir.Mem) and not s.src.es:
+                                    src_raw = s.src.addr if isinstance(s.src.addr, int) else (
+                                        s.src.addr.value if isinstance(s.src.addr, ir.Const) else None)
+                                    if src_raw is not None and src_raw < 0xFFF00:
+                                        local_load[s.dst.name] = s.src
+                        elif isinstance(s.dst, (ir.Var, ir.StackVar)):
+                            for k in [k for k, v in local_load.items() if _mentions_var(v, s.dst.name)]:
+                                local_load.pop(k, None)
+                        elif isinstance(s.dst, ir.Mem):
+                            raw = None if s.dst.es else (s.dst.addr if isinstance(s.dst.addr, int) else (
+                                s.dst.addr.value if isinstance(s.dst.addr, ir.Const) else None))
+                            for k in [k for k, v in local_load.items() if _mentions_mem(v, raw)]:
+                                local_load.pop(k, None)
+                        elif isinstance(s.dst, ir.Bit):
+                            cur = _kill_val(cur, s.dst.base)
+                elif isinstance(s, ir.Swap):
+                    cur = _kill_val(cur, s.a)
+                    cur = _kill_val(cur, s.b)
+                    local_load.clear()
+                elif isinstance(s, ir.Call):
+                    cur = _ES_TOP
+                    local_load.clear()
+                elif isinstance(s, ir.Intrinsic):
+                    if s.name == "sel":
+                        if cur not in (_ES_UNDEF, _ES_TOP) and _mentions_any_atom(cur, regs.GPR_ATOMS):
+                            cur = _ES_TOP
+                        local_load.clear()
+                    elif s.name in ("push", "ei", "di", "nop"):
+                        pass
+                    elif s.name in ("pop", "set_bit", "clr_bit"):
+                        if s.args:
+                            tgt = s.args[0].base if isinstance(s.args[0], ir.Bit) else s.args[0]
+                            cur = _kill_val(cur, tgt)
+                            if isinstance(tgt, ir.Reg):
+                                local_load.pop(tgt.name, None)
+                    else:
+                        cur = _ES_TOP
+                        local_load.clear()
+
+            if cur != out_es.get(b.start, _ES_UNDEF):
+                out_es[b.start] = cur
+                changed = True
+
+    return in_es
 
 
 def optimize(func, default_bank=0):
@@ -792,7 +1162,10 @@ def optimize(func, default_bank=0):
         for kind, succ_ea in b.succ:
             preds.setdefault(succ_ea, []).append(b_start)
 
-    # Pass 2: Forward chaining across CFG along single-predecessor edges
+    # Inter-block ES dataflow across joins and loops
+    in_es = _compute_block_es(func, preds)
+
+    # Pass 2: Forward chaining across CFG along single-predecessor edges + ES dataflow
     out_envs = {}
     for b in func.ordered():
         p_list = preds.get(b.start, [])
@@ -804,6 +1177,13 @@ def optimize(func, default_bank=0):
         for vname, val in func_consts.items():
             if vname not in env.var_consts:
                 env.var_consts[vname] = val
+
+        es_entry = in_es.get(b.start, _ES_TOP)
+        if env.atom_consts.get("es") is None:
+            if isinstance(es_entry, ir.Const):
+                env.set_const("es", es_entry.value & 0xF)
+            elif es_entry not in (_ES_UNDEF, _ES_TOP) and env.es_expr is None:
+                env.es_expr = es_entry
 
         _opt_block(b, default_bank=default_bank, initial_env=env)
         out_envs[b.start] = env

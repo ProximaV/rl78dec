@@ -350,6 +350,148 @@ def test_brk_and_callt_semantics():
     print("ok  test_brk_and_callt_semantics")
 
 
+def test_es_20bit_resolution_and_formatting():
+    from rl78dec import ir, opt, cgen, cfg, frame, spill, abi, vars as rvars, structure
+    from rl78dec.names import Namer
+
+    # 1. set_bit (mov1 es:[hl].1, cy) must NOT clobber ES or HL -> resolves to symbol name
+    #    41 0F          mov es, #0Fh
+    #    36 1E EA       movw hl, #0EA1Eh
+    #    11 71 11       mov1 es:[hl].1, cy
+    #    11 8B          mov a, es:[hl]
+    #    D7             ret
+    raw1 = bytes([0x41, 0x0F, 0x36, 0x1E, 0xEA, 0x11, 0x71, 0x11, 0x11, 0x8B, 0xD7])
+    prog1 = decompile_image(_img(raw1), entries=[0], cell_names={0xFEA1E: "isVoltageDeviceThere"})
+    t1 = "\n".join(prog1.funcs[0].lines)
+    assert "isVoltageDeviceThere" in t1, t1
+    assert "es_mem" not in t1, t1
+    assert "(uint32_t)es" not in t1, t1
+
+    # 2. Constant ES=0xF through tmp_seg (0xFFED4) + dynamic pointer offset -> *(uint8_t *)(0xF0000 | ...)
+    #    51 0F          mov a, #0Fh
+    #    9D D4          mov 0xFFED4, a
+    #    8D D4          mov a, 0xFFED4
+    #    9E FD          mov es, a
+    #    14             movw de, ax     (actually let's use AX live-in as offset via movw hl, ax = 16)
+    #    wait: use movw hl, bc (movw ax, bc = 13; movw hl, ax = 16) so offset is a1!
+    #    13             movw ax, bc
+    #    16             movw hl, ax
+    #    51 0F          mov a, #0Fh
+    #    9D D4          mov 0xFFED4, a
+    #    8D D4          mov a, 0xFFED4
+    #    9E FD          mov es, a
+    #    11 8B          mov a, es:[hl]
+    #    D7             ret
+    raw2 = bytes([0x13, 0x16, 0x51, 0x0F, 0x9D, 0xD4, 0x8D, 0xD4, 0x9E, 0xFD, 0x11, 0x8B, 0xD7])
+    prog2 = decompile_image(_img(raw2), entries=[0])
+    t2 = "\n".join(prog2.funcs[0].lines)
+    assert "*(uint8_t *)(0xF0000 |" in t2, t2
+    assert "es_mem" not in t2, t2
+
+    # 3. Constant ES=0xF + small struct/field offset [de + 3] must NOT become ram_0003[de]
+    #    14             movw de, ax
+    #    41 0F          mov es, #0Fh
+    #    11 8A 03       mov a, es:[de+3]
+    #    D7             ret
+    raw3 = bytes([0x14, 0x41, 0x0F, 0x11, 0x8A, 0x03, 0xD7])
+    prog3 = decompile_image(_img(raw3), entries=[0])
+    t3 = "\n".join(prog3.funcs[0].lines)
+    assert "*(uint8_t *)(0xF0000 | (a0 + 3))" in t3, t3
+    assert "ram_0003" not in t3, t3
+    assert "es_mem" not in t3, t3
+
+    # 4. Constant ES=0x0 + ROM address 0x9000 must stay in segment 0 across 2-pass opt (NOT 0xF9000!)
+    #    41 00          mov es, #0
+    #    11 8F 00 90    mov a, es:!0x9000
+    #    D7             ret
+    raw4 = bytes([0x41, 0x00, 0x11, 0x8F, 0x00, 0x90, 0xD7])
+    prog4 = decompile_image(_img(raw4), entries=[0], cell_names={0x09000: "rom_const_9000"})
+    t4 = "\n".join(prog4.funcs[0].lines)
+    assert "rom_const_9000" in t4, t4
+    assert "ram_9000" not in t4, t4
+    assert "es_mem" not in t4, t4
+
+    # 5. Dynamic ES loaded from RAM variable (byte_FEC9C) -> ((uint32_t)byte_FEC9C << 16) | ...
+    #    16             movw hl, ax
+    #    8F 9C EC       mov a, !0xEC9C
+    #    9E FD          mov es, a
+    #    11 8B          mov a, es:[hl]
+    #    D7             ret
+    raw5 = bytes([0x16, 0x8F, 0x9C, 0xEC, 0x9E, 0xFD, 0x11, 0x8B, 0xD7])
+    prog5 = decompile_image(_img(raw5), entries=[0], cell_names={0xFEC9C: "byte_FEC9C"})
+    t5 = "\n".join(prog5.funcs[0].lines)
+    assert "*(uint8_t *)(((uint32_t)byte_FEC9C << 16) | a0)" in t5, t5
+    assert "es_mem" not in t5, t5
+
+    # 6. Unknown live-in ES -> ((uint32_t)es << 16) | ... (no es_mem)
+    #    16             movw hl, ax
+    #    11 8B          mov a, es:[hl]
+    #    D7             ret
+    raw6 = bytes([0x16, 0x11, 0x8B, 0xD7])
+    prog6 = decompile_image(_img(raw6), entries=[0])
+    t6 = "\n".join(prog6.funcs[0].lines)
+    assert "*(uint8_t *)(((uint32_t)es << 16) | a0)" in t6, t6
+    assert "es_mem" not in t6, t6
+
+    # 7. Split 32-bit far pointer (sub_79CC pattern: de clobbered after saving e to saddr_D5)
+    b0 = cfg.Block(0x100)
+    b0.stmts = [
+        ir.Call(0x100, target=0x1000, dst=ir.Reg("de:bc", "d")),
+        ir.Assign(0x104, ir.Reg("a", "b"), ir.Reg("e", "b")),
+        ir.Assign(0x105, ir.Mem(0xFFED5, "b"), ir.Reg("a", "b")),
+        ir.Assign(0x107, ir.Reg("es", "b"), ir.Mem(0xFFED5, "b")),
+        ir.Assign(0x10A, ir.Reg("de", "w"), ir.Const(0x1234, "w")),
+        ir.Assign(0x10D, ir.Reg("a", "b"), ir.Mem(ir.Bin("+", ir.Reg("bc", "w"), ir.Const(0xCA, "a")), "b", es=True)),
+        ir.Ret(0x111, val=ir.Reg("a", "b")),
+    ]
+    b0.term = "ret"
+    f7 = cfg.Func(0x100)
+    f7.blocks[0x100] = b0
+    f7.name = "sub_split_far"
+    fi7 = frame.FrameInfo(f7)
+    opt.optimize(f7)
+    sig7 = abi.FunctionSig(name="sub_split_far", ret_type="uint8_t", ret_expr=ir.Reg("a", "b"), params=[])
+    rvars.recover_variables(f7, sig7, fi7)
+    tree7 = structure.structure(f7)
+    t7 = "\n".join(cgen.generate(f7, tree7, Namer(), frame_info=fi7, sig=sig7))
+    assert "*(uint8_t *)(v0 + 0xCA)" in t7, t7
+    assert "es_mem" not in t7, t7
+    assert "(uint32_t)es" not in t7, t7
+
+    # 8. Spilled es:[de+2] call argument inherits resolved ES from its push site (sub_6AAA pattern)
+    b8 = cfg.Block(0x200)
+    b8.stmts = [
+        ir.Assign(0x200, ir.Reg("es", "b"), ir.Const(0, "b")),
+        ir.Assign(0x202, ir.Reg("ax", "w"), ir.Mem(ir.Bin("+", ir.Reg("de", "w"), ir.Const(2, "b")), "w", es=True)),
+        ir.Intrinsic(0x204, "push", [ir.Reg("ax", "w")]),
+        ir.Assign(0x205, ir.Reg("ax", "w"), ir.Const(0x9999, "w")),
+        ir.Call(0x208, target=0x300),
+        ir.Assign(0x20C, ir.Reg("sp", "w"), ir.Bin("+", ir.Reg("sp", "w"), ir.Const(2, "w"))),
+        ir.Ret(0x20E),
+    ]
+    b8.term = "ret"
+    f8 = cfg.Func(0x200)
+    f8.blocks[0x200] = b8
+    f8.name = "sub_spill_es"
+    fi8 = frame.FrameInfo(f8)
+    spill.eliminate_spills(f8, fi8)
+    opt.optimize(f8)
+    sig8 = abi.FunctionSig(name="sub_spill_es", ret_type="void", ret_expr=None, params=[])
+    rvars.recover_variables(f8, sig8, fi8)
+    tree8 = structure.structure(f8)
+    t8 = "\n".join(cgen.generate(f8, tree8, Namer(), frame_info=fi8, sig=sig8))
+    assert "*(uint16_t *)(" in t8 and "+ 2)" in t8, t8
+    assert "(uint32_t)es" not in t8, t8
+    assert "es_mem" not in t8, t8
+
+    # 9. cgen guards: simplify_math collapsing Bin -> Const, and cast parens around Bin
+    em = cgen._Emit(Namer())
+    assert em.expr(ir.Bin("-", ir.Var("x"), ir.Var("x"))) == "0"
+    assert em.expr(ir.Un("(uint8_t)", ir.Bin(">>", ir.Var("v0", "d"), ir.Const(16)))) == "(uint8_t)(v0 >> 0x10)"
+
+    print("ok  test_es_20bit_resolution_and_formatting")
+
+
 if __name__ == "__main__":
     test_decode_fields()
     test_all_first_bytes()
@@ -361,4 +503,5 @@ if __name__ == "__main__":
     test_struct_pointer_cascading()
     test_math_simplification()
     test_brk_and_callt_semantics()
+    test_es_20bit_resolution_and_formatting()
     print("\nall tests passed")

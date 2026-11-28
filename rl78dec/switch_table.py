@@ -135,6 +135,10 @@ def detect_switch(image, insns, br_ins, base=0):
         shlw_idx = window.index(shlw_ins)
         for it in window[shlw_idx:]:
             dispatch_eas.add(it.ea)
+        # Preserve a trailing `mov es, ...` restoring ES for the switch case handlers
+        if (window and window[-1].mnem == "mov" and window[-1].ops and
+                window[-1].ops[0].mode == "reg" and window[-1].ops[0].reg == "es"):
+            dispatch_eas.discard(window[-1].ea)
         if idx_reg == "a":
             for it in reversed(window[:shlw_idx]):
                 if it.mnem == "clrb":

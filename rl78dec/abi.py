@@ -448,8 +448,11 @@ def _collect_expr_used_atoms(e, out):
     elif isinstance(e, ir.IntrExpr):
         for a in e.args:
             _collect_expr_used_atoms(a, out)
-    elif isinstance(e, ir.Mem) and isinstance(e.addr, ir.Expr):
-        _collect_expr_used_atoms(e.addr, out)
+    elif isinstance(e, ir.Mem):
+        if isinstance(e.addr, ir.Expr):
+            _collect_expr_used_atoms(e.addr, out)
+        if isinstance(e.seg, ir.Expr):
+            _collect_expr_used_atoms(e.seg, out)
 
 
 def _get_block_last_read_ea(b):
@@ -493,16 +496,150 @@ def _get_block_last_read_ea(b):
     return last_read
 
 
-def _infer_return(func, hidden_stmts):
+def _scan_block_return_candidate(b, hidden_stmts, extra_popped=frozenset()):
+    """Scan a block backwards for trailing return-register assignments.
+
+    Returns (cand_type, cand_expr, cand_reg, popped_atoms, is_pure_epilogue).
+    """
+    stmts = b.stmts
+    if stmts and isinstance(stmts[-1], (ir.Ret, ir.Goto, ir.Branch)):
+        stmts = stmts[:-1]
+
+    assigned = {}
+    popped_atoms = set(extra_popped)
+    consumed_atoms = set()
+    last_read_ea = _get_block_last_read_ea(b)
+    saw_non_hidden = False
+
+    for s in reversed(stmts):
+        if isinstance(s, ir.Intrinsic) and s.name == "pop":
+            if s.args and isinstance(s.args[0], ir.Reg):
+                popped_atoms.update(regs.atoms(s.args[0].name))
+            continue
+        if id(s) in hidden_stmts or isinstance(s, ir.Nop):
+            continue
+        saw_non_hidden = True
+        if isinstance(s, ir.Assign):
+            if isinstance(s.dst, ir.Mem):
+                break
+            if isinstance(s.dst, ir.Reg):
+                dname = s.dst.name
+                datoms = set(regs.atoms(dname))
+                s_ea = getattr(s, "ea", None)
+                read_later = s_ea is not None and any(last_read_ea.get(a, -1) > s_ea for a in datoms)
+                if not (datoms <= popped_atoms) and not (datoms <= consumed_atoms) and not read_later:
+                    if dname not in assigned:
+                        assigned[dname] = s.src
+                _collect_expr_used_atoms(s.src, consumed_atoms)
+            else:
+                _collect_expr_used_atoms(s.src, consumed_atoms)
+        elif isinstance(s, ir.Swap):
+            for r in (s.a, s.b):
+                if isinstance(r, ir.Reg):
+                    datoms = set(regs.atoms(r.name))
+                    if not (datoms <= popped_atoms) and not (datoms <= consumed_atoms) and r.name not in assigned:
+                        assigned[r.name] = r
+        elif isinstance(s, (ir.Call, ir.Branch, ir.Goto, ir.Compare, ir.Intrinsic)):
+            break
+
+    cand_expr = None
+    cand_type = "void"
+    cand_reg = None
+
+    has_bc = "bc" in assigned or "c" in assigned
+    has_de = "de" in assigned or "e" in assigned
+    has_cy = "cy" in assigned
+
+    if has_bc and has_de:
+        cand_type = "uint32_t"
+        cand_reg = "de:bc"
+        de_src = assigned.get("de", assigned.get("e"))
+        bc_src = assigned.get("bc", assigned.get("c"))
+        if isinstance(de_src, ir.Const) and isinstance(bc_src, ir.Const):
+            cand_expr = ir.Const(((de_src.value << 16) | bc_src.value) & 0xFFFFFFFF, width="d")
+        else:
+            de_reg = ir.Reg("de" if "de" in assigned else "e")
+            bc_reg = ir.Reg("bc" if "bc" in assigned else "c")
+            de_part = de_src if isinstance(de_src, ir.Const) else de_reg
+            bc_part = bc_src if isinstance(bc_src, ir.Const) else bc_reg
+            cand_expr = _consolidate_pair(bc_part, de_part)
+    elif "bc" in assigned:
+        cand_type = "uint16_t"
+        cand_reg = "bc"
+        cand_expr = assigned["bc"] if isinstance(assigned["bc"], ir.Const) else ir.Reg("bc")
+    elif "ax" in assigned:
+        cand_type = "uint16_t"
+        cand_reg = "ax"
+        cand_expr = assigned["ax"] if isinstance(assigned["ax"], ir.Const) else ir.Reg("ax")
+    elif "de" in assigned:
+        cand_type = "uint16_t"
+        cand_reg = "de"
+        cand_expr = assigned["de"] if isinstance(assigned["de"], ir.Const) else ir.Reg("de")
+    elif "c" in assigned:
+        cand_type = "uint8_t"
+        cand_reg = "c"
+        cand_expr = assigned["c"] if isinstance(assigned["c"], ir.Const) else ir.Reg("c")
+    elif "a" in assigned:
+        cand_type = "uint8_t"
+        cand_reg = "a"
+        cand_expr = assigned["a"] if isinstance(assigned["a"], ir.Const) else ir.Reg("a")
+    elif "e" in assigned:
+        cand_type = "uint8_t"
+        cand_reg = "e"
+        cand_expr = assigned["e"] if isinstance(assigned["e"], ir.Const) else ir.Reg("e")
+    elif has_cy:
+        cand_type = "bool"
+        cand_reg = "cy"
+        cand_expr = assigned["cy"] if isinstance(assigned["cy"], ir.Const) else ir.Reg("cy")
+
+    return cand_type, cand_expr, cand_reg, popped_atoms, (not saw_non_hidden)
+
+
+def _ret_expr_for_reg(reg_name):
+    if reg_name == "de:bc":
+        return _consolidate_pair(ir.Reg("bc"), ir.Reg("de"))
+    return ir.Reg(reg_name)
+
+
+def _default_reg_for_type(type_str):
+    t = (type_str or "").strip().lower()
+    if t == "bool":
+        return "cy"
+    if "*" not in t and ("32" in t or "long" in t or "dword" in t):
+        return "de:bc"
+    if "*" not in t and t in ("uint8_t", "int8_t", "unsigned char", "signed char", "char", "byte"):
+        return "c"
+    return "bc"
+
+
+def _reg_matches_type(reg_name, type_str):
+    t = (type_str or "").strip().lower()
+    if t == "bool":
+        return reg_name in ("cy", "c", "a")
+    if "*" not in t and ("32" in t or "long" in t or "dword" in t):
+        return reg_name == "de:bc"
+    if "*" not in t and t in ("uint8_t", "int8_t", "unsigned char", "signed char", "char", "byte"):
+        return reg_name in ("c", "a", "e", "x")
+    return reg_name in ("bc", "ax", "de")
+
+
+def _infer_return(func, hidden_stmts, forced_ret_type=None):
     """Determine the function return type and return expression from exit blocks.
 
     A function has a non-void return type if and only if EVERY exit block consistently
-    assigns the candidate return register (AX, BC, A, or C) as its last non-boilerplate
-    statement before returning.
+    assigns the candidate return register (AX, BC, A, C, or DE:BC) as its last
+    non-boilerplate statement before returning (including through shared epilogue blocks),
+    or when *forced_ret_type* is explicitly provided by a user/IDA prototype.
     """
     ret_expr = None
     ret_type = "void"
 
+    preds = {}
+    for blk in func.blocks.values():
+        for _, succ_ea in blk.succ:
+            preds.setdefault(succ_ea, []).append(blk)
+
+    exit_blocks = []
     exit_ret_info = []
     ret_block_count = 0
 
@@ -511,91 +648,32 @@ def _infer_return(func, hidden_stmts):
             ret_block_count += 1
             if getattr(b.stmts[-1], "kind", "ret") in ("reti", "retb"):
                 continue
-            cand_expr = None
-            cand_type = "void"
-            cand_reg = None
+            exit_blocks.append(b)
 
-            assigned = {}
-            popped_atoms = set()
-            consumed_atoms = set()
-            last_read_ea = _get_block_last_read_ea(b)
+            cand_type, cand_expr, cand_reg, popped_atoms, is_pure_epilogue = _scan_block_return_candidate(
+                b, hidden_stmts
+            )
 
-            for s in reversed(b.stmts[:-1]):
-                if isinstance(s, ir.Intrinsic) and s.name == "pop":
-                    if s.args and isinstance(s.args[0], ir.Reg):
-                        popped_atoms.update(regs.atoms(s.args[0].name))
-                    continue
-                if id(s) in hidden_stmts:
-                    continue
-                if isinstance(s, ir.Assign):
-                    if isinstance(s.dst, ir.Mem):
-                        break
-                    if isinstance(s.dst, ir.Reg):
-                        dname = s.dst.name
-                        datoms = set(regs.atoms(dname))
-                        s_ea = getattr(s, "ea", None)
-                        read_later = s_ea is not None and any(last_read_ea.get(a, -1) > s_ea for a in datoms)
-                        if not (datoms <= popped_atoms) and not (datoms <= consumed_atoms) and not read_later:
-                            if dname not in assigned:
-                                assigned[dname] = s.src
-                        _collect_expr_used_atoms(s.src, consumed_atoms)
-                    else:
-                        _collect_expr_used_atoms(s.src, consumed_atoms)
-                elif isinstance(s, ir.Swap):
-                    for r in (s.a, s.b):
-                        if isinstance(r, ir.Reg):
-                            datoms = set(regs.atoms(r.name))
-                            if not (datoms <= popped_atoms) and not (datoms <= consumed_atoms) and r.name not in assigned:
-                                assigned[r.name] = r
-                elif isinstance(s, (ir.Call, ir.Branch, ir.Goto, ir.Compare, ir.Intrinsic)):
-                    break
-
-            has_bc = "bc" in assigned or "c" in assigned
-            has_de = "de" in assigned or "e" in assigned
-            has_ax = "ax" in assigned or "a" in assigned
-            has_cy = "cy" in assigned
-
-            if has_bc and has_de:
-                cand_type = "uint32_t"
-                cand_reg = "de:bc"
-                de_src = assigned.get("de", assigned.get("e"))
-                bc_src = assigned.get("bc", assigned.get("c"))
-                if isinstance(de_src, ir.Const) and isinstance(bc_src, ir.Const):
-                    cand_expr = ir.Const(((de_src.value << 16) | bc_src.value) & 0xFFFFFFFF, width="d")
-                else:
-                    de_reg = ir.Reg("de" if "de" in assigned else "e")
-                    bc_reg = ir.Reg("bc" if "bc" in assigned else "c")
-                    de_part = de_src if isinstance(de_src, ir.Const) else de_reg
-                    bc_part = bc_src if isinstance(bc_src, ir.Const) else bc_reg
-                    cand_expr = _consolidate_pair(bc_part, de_part)
-            elif "bc" in assigned:
-                cand_type = "uint16_t"
-                cand_reg = "bc"
-                cand_expr = assigned["bc"] if isinstance(assigned["bc"], ir.Const) else ir.Reg("bc")
-            elif "ax" in assigned:
-                cand_type = "uint16_t"
-                cand_reg = "ax"
-                cand_expr = assigned["ax"] if isinstance(assigned["ax"], ir.Const) else ir.Reg("ax")
-            elif "de" in assigned:
-                cand_type = "uint16_t"
-                cand_reg = "de"
-                cand_expr = assigned["de"] if isinstance(assigned["de"], ir.Const) else ir.Reg("de")
-            elif "c" in assigned:
-                cand_type = "uint8_t"
-                cand_reg = "c"
-                cand_expr = assigned["c"] if isinstance(assigned["c"], ir.Const) else ir.Reg("c")
-            elif "a" in assigned:
-                cand_type = "uint8_t"
-                cand_reg = "a"
-                cand_expr = assigned["a"] if isinstance(assigned["a"], ir.Const) else ir.Reg("a")
-            elif "e" in assigned:
-                cand_type = "uint8_t"
-                cand_reg = "e"
-                cand_expr = assigned["e"] if isinstance(assigned["e"], ir.Const) else ir.Reg("e")
-            elif has_cy:
-                cand_type = "bool"
-                cand_reg = "cy"
-                cand_expr = assigned["cy"] if isinstance(assigned["cy"], ir.Const) else ir.Reg("cy")
+            # Shared epilogue block (e.g. `addw sp, #N; pop hl; ret`): check predecessor blocks
+            if cand_type == "void" and is_pure_epilogue and preds.get(b.start):
+                pred_cands = []
+                b_preds = preds[b.start]
+                for p in b_preds:
+                    pt, pe, pr, _, _ = _scan_block_return_candidate(
+                        p, hidden_stmts, extra_popped=popped_atoms
+                    )
+                    if pt != "void":
+                        pred_cands.append((pt, pe, pr))
+                if len(pred_cands) == len(b_preds) and pred_cands:
+                    p_type0 = pred_cands[0][0]
+                    p_reg0 = pred_cands[0][2]
+                    if all(pc[0] == p_type0 and pc[2] == p_reg0 for pc in pred_cands):
+                        cand_type = p_type0
+                        cand_reg = p_reg0
+                        if len(pred_cands) == 1 and isinstance(pred_cands[0][1], ir.Const):
+                            cand_expr = pred_cands[0][1]
+                        else:
+                            cand_expr = _ret_expr_for_reg(p_reg0)
 
             if cand_type != "void":
                 exit_ret_info.append((b, cand_type, cand_expr, cand_reg))
@@ -606,11 +684,37 @@ def _infer_return(func, hidden_stmts):
         first_reg = exit_ret_info[0][3]
         if all(info[1] == first_type and info[3] == first_reg for info in exit_ret_info):
             ret_type = first_type
-            # Set each return block's Ret statement value to its specific return expression
             for b, ctype, cexpr, creg in exit_ret_info:
                 if b.stmts and isinstance(b.stmts[-1], ir.Ret):
                     b.stmts[-1].val = cexpr
             ret_expr = exit_ret_info[0][2]
+
+    # When a non-void prototype is explicitly provided, bind return expressions on all exit blocks
+    if forced_ret_type and forced_ret_type.strip() != "void" and exit_blocks:
+        if ret_type != "void":
+            ret_type = forced_ret_type
+        else:
+            chosen_reg = None
+            info_by_blk = {b.start: (ctype, cexpr, creg) for b, ctype, cexpr, creg in exit_ret_info}
+            matching = [creg for _, _, _, creg in exit_ret_info if _reg_matches_type(creg, forced_ret_type)]
+            if matching:
+                chosen_reg = max(set(matching), key=matching.count)
+            elif exit_ret_info:
+                regs_found = [creg for _, _, _, creg in exit_ret_info]
+                chosen_reg = max(set(regs_found), key=regs_found.count)
+            else:
+                chosen_reg = _default_reg_for_type(forced_ret_type)
+
+            ret_type = forced_ret_type
+            for b in exit_blocks:
+                if b.stmts[-1].val is not None:
+                    continue
+                info = info_by_blk.get(b.start)
+                if info and info[2] == chosen_reg:
+                    b.stmts[-1].val = info[1]
+                else:
+                    b.stmts[-1].val = _ret_expr_for_reg(chosen_reg)
+            ret_expr = exit_blocks[0].stmts[-1].val
 
     # If void, make sure all Ret statements have val = None
     if ret_type == "void":
@@ -682,8 +786,11 @@ def _infer_call_return(func, b, i, frame_info):
             elif isinstance(e, ir.IntrExpr):
                 for a in e.args:
                     collect_reg_names(a)
-            elif isinstance(e, ir.Mem) and isinstance(e.addr, ir.Expr):
-                collect_reg_names(e.addr)
+            elif isinstance(e, ir.Mem):
+                if isinstance(e.addr, ir.Expr):
+                    collect_reg_names(e.addr)
+                if isinstance(e.seg, ir.Expr):
+                    collect_reg_names(e.seg)
 
         if isinstance(s, ir.Assign):
             collect_reg_names(s.src)
@@ -922,7 +1029,7 @@ def analyze_calling_convention(func, frame_info, ida_type_info=None, user_proto=
 
     params = []
 
-    # 1. Register parameter 0 (AX / A)
+    # 1. User / IDA explicit prototype
     if user_proto:
         parsed = parse_prototype(user_proto)
         if parsed:
@@ -931,10 +1038,18 @@ def analyze_calling_convention(func, frame_info, ida_type_info=None, user_proto=
             if u_name:
                 func.name = u_name
             params = []
+            def _is_byte_type(tstr):
+                t = (tstr or "").strip().lower()
+                if "*" in t:
+                    return False
+                return t in ("uint8_t", "int8_t", "unsigned char", "signed char", "char", "bool", "byte")
+
             if len(u_params) >= 1:
-                params.append(Param(u_params[0][0] or "a0", u_params[0][1], "ax"))
+                loc0 = "a" if _is_byte_type(u_params[0][1]) else "ax"
+                params.append(Param(u_params[0][0] or "a0", u_params[0][1], loc0))
             if len(u_params) >= 2:
-                params.append(Param(u_params[1][0] or "a1", u_params[1][1], "bc"))
+                loc1 = "c" if _is_byte_type(u_params[1][1]) else "bc"
+                params.append(Param(u_params[1][0] or "a1", u_params[1][1], loc1))
             sorted_args = sorted(frame_info.args.items(), key=lambda kv: kv[1][0].offset)
             for i, (name, (var, width)) in enumerate(sorted_args):
                 if name in ("a0", "a1"):
@@ -946,8 +1061,18 @@ def analyze_calling_convention(func, frame_info, ida_type_info=None, user_proto=
                 else:
                     tstr = "uint16_t" if width == "w" else "uint8_t"
                     params.append(Param(name, tstr, "stack"))
+
+            if ret_type.strip() == "void":
+                ret_expr = None
+                for b in func.blocks.values():
+                    for s in b.stmts:
+                        if isinstance(s, ir.Ret):
+                            s.val = None
+            else:
+                ret_type, ret_expr = _infer_return(func, frame_info.hidden_stmts, forced_ret_type=ret_type)
+
             _recover_call_sites(func, frame_info, live_atoms=live_atoms, proto_params=params)
-            return FunctionSig(name=func.name, ret_type=ret_type, ret_expr=None, params=params)
+            return FunctionSig(name=func.name, ret_type=ret_type, ret_expr=ret_expr, params=params)
 
     # 1. Register parameter 0 (AX / A) and Register parameter 1 (BC / C)
     has_ax = ("x" in live_atoms or ("a" in live_atoms and "x" in live_atoms) or "a" in live_atoms)
@@ -961,12 +1086,64 @@ def analyze_calling_convention(func, frame_info, ida_type_info=None, user_proto=
         elif 0 in getattr(frame_info, "homed_slot_to_arg", {}) and 2 in getattr(frame_info, "homed_slot_to_arg", {}):
             is_far_reg = True
 
+    def _rewrite_mem_seg(match_names, target_var_name):
+        repl_seg = ir.Un("(uint8_t)", ir.Bin(">>", ir.Var(target_var_name, "d"), ir.Const(16)))
+        def _rw_expr(e):
+            if isinstance(e, ir.Mem):
+                if isinstance(e.seg, (ir.Var, ir.StackVar, ir.Reg)) and e.seg.name in match_names:
+                    e.seg = repl_seg
+                if isinstance(e.addr, ir.Expr):
+                    _rw_expr(e.addr)
+            elif isinstance(e, ir.Bin):
+                _rw_expr(e.l)
+                _rw_expr(e.r)
+            elif isinstance(e, ir.Un):
+                _rw_expr(e.e)
+            elif isinstance(e, ir.Bit):
+                _rw_expr(e.base)
+            elif isinstance(e, ir.IntrExpr):
+                for a in e.args:
+                    _rw_expr(a)
+        for blk in func.blocks.values():
+            for st in blk.stmts:
+                if isinstance(st, ir.Assign):
+                    _rw_expr(st.dst)
+                    _rw_expr(st.src)
+                elif isinstance(st, ir.Compare) and st.flag:
+                    if st.flag.a:
+                        _rw_expr(st.flag.a)
+                    if st.flag.b:
+                        _rw_expr(st.flag.b)
+                elif isinstance(st, ir.Branch):
+                    if isinstance(st.cond, ir.Expr):
+                        _rw_expr(st.cond)
+                    if st.bittest and isinstance(st.bittest[0], ir.Expr):
+                        _rw_expr(st.bittest[0])
+                    if st.flag:
+                        if st.flag.a:
+                            _rw_expr(st.flag.a)
+                        if st.flag.b:
+                            _rw_expr(st.flag.b)
+                elif isinstance(st, ir.Call):
+                    for a in st.args:
+                        _rw_expr(a)
+                    if st.expr:
+                        _rw_expr(st.expr)
+                elif isinstance(st, ir.Intrinsic):
+                    for a in st.args:
+                        _rw_expr(a)
+                elif isinstance(st, ir.Ret) and st.val:
+                    _rw_expr(st.val)
+                elif isinstance(st, ir.Switch) and st.expr:
+                    _rw_expr(st.expr)
+
     if is_far_reg:
         params.append(Param("a0", "uint32_t", "ax:bc"))
         if "a0" in frame_info.args:
             frame_info.args["a0"] = (frame_info.args["a0"][0], "d")
         if "a1" in frame_info.args:
             del frame_info.args["a1"]
+        _rewrite_mem_seg({"a1", "c", "bc"}, "a0")
         for b in func.blocks.values():
             for st in b.stmts:
                 if isinstance(st, ir.Assign):
@@ -1014,6 +1191,8 @@ def analyze_calling_convention(func, frame_info, ida_type_info=None, user_proto=
             frame_info.args[name1] = (var1, "d")
             if name2 and name2 in frame_info.args:
                 del frame_info.args[name2]
+            if name2:
+                _rewrite_mem_seg({name2}, name1)
             for b in func.blocks.values():
                 for st in b.stmts:
                     if isinstance(st, ir.Assign):

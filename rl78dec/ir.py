@@ -93,14 +93,16 @@ class StackVar(Var):
 
 class Mem(Expr):
     """A memory access at address *addr* (an Expr), width b/w.  ``es`` marks the
-    ES: far-data prefix; ``name`` is an optional symbolic label (SFR/saddr)."""
-    __slots__ = ("addr", "width", "es", "name")
+    ES: far-data prefix; ``seg`` holds the resolved segment expression when known;
+    ``name`` is an optional symbolic label (SFR/saddr)."""
+    __slots__ = ("addr", "width", "es", "name", "seg")
 
-    def __init__(self, addr, width="b", es=False, name=None):
+    def __init__(self, addr, width="b", es=False, name=None, seg=None):
         self.addr = addr
         self.width = width
         self.es = es
         self.name = name
+        self.seg = seg
 
     def __eq__(self, o):
         return (
@@ -108,11 +110,12 @@ class Mem(Expr):
             o.addr == self.addr and
             o.width == self.width and
             o.es == self.es and
-            o.name == self.name
+            o.name == self.name and
+            o.seg == self.seg
         )
 
     def __hash__(self):
-        return hash(("mem", self.addr, self.width, self.es, self.name))
+        return hash(("mem", self.addr, self.width, self.es, self.name, self.seg))
 
 
 class Bit(Expr):

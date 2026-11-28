@@ -108,13 +108,98 @@ def _infer_struct_pointers(func, struct_defs, symbol_structs, user_types=None, s
     return var_structs
 
 
+def _infer_far_pointers(func, sig=None, frame_info=None):
+    """Identify 20/32-bit far pointer variables and variables derived from them (var -> root_far_name)."""
+    far_vars = {}
+    if sig and getattr(sig, "params", None):
+        for p in sig.params:
+            tstr = (getattr(p, "type_str", None) or "").strip()
+            if tstr == "uint32_t" or getattr(p, "location", None) == "ax:bc":
+                far_vars[p.name] = p.name
+    if frame_info:
+        for name, (var, width) in (getattr(frame_info, "args", None) or {}).items():
+            if width == "d":
+                far_vars[name] = name
+        for name, (var, width) in (getattr(frame_info, "locals", None) or {}).items():
+            if width == "d":
+                far_vars[name] = name
+        for name, (var, width) in (getattr(frame_info, "virtual_vars", None) or {}).items():
+            if width == "d":
+                far_vars[name] = name
+
+    if not far_vars:
+        return far_vars
+
+    hidden = frame_info.hidden_stmts if frame_info else frozenset()
+
+    def _far_root(e):
+        if isinstance(e, (ir.Var, ir.Reg)):
+            return far_vars.get(e.name)
+        if isinstance(e, ir.Bin) and e.op in ("+", "-"):
+            r = _far_root(e.l)
+            if r:
+                return r
+            if e.op == "+":
+                return _far_root(e.r)
+        return None
+
+    changed = True
+    while changed:
+        changed = False
+        for blk in func.blocks.values():
+            for s in blk.stmts:
+                if id(s) in hidden:
+                    continue
+                if isinstance(s, ir.Assign) and isinstance(s.dst, (ir.Var, ir.Reg)):
+                    if isinstance(s.dst, ir.Var) and getattr(s.dst, "width", None) == "b":
+                        continue
+                    root = _far_root(s.src)
+                    if root and far_vars.get(s.dst.name) != root:
+                        far_vars[s.dst.name] = root
+                        changed = True
+    return far_vars
+
+
+def _extract_far_base(addr, far_vars):
+    if not far_vars:
+        return None
+    if isinstance(addr, (ir.Var, ir.Reg)):
+        return far_vars.get(addr.name)
+    if isinstance(addr, ir.Bin) and addr.op in ("+", "-"):
+        r = _extract_far_base(addr.l, far_vars)
+        if r:
+            return r
+        if addr.op == "+":
+            return _extract_far_base(addr.r, far_vars)
+    return None
+
+
+def _seg_extracts_var(seg):
+    """If seg is (uint8_t)(v >> 16), (uint16_t)(v >> 16), or v >> 16, return v.name."""
+    e = seg
+    if isinstance(e, ir.Un) and e.op in ("(uint8_t)", "(uint16_t)"):
+        e = e.e
+    if isinstance(e, ir.Bin) and e.op == ">>" and isinstance(e.r, ir.Const) and e.r.value == 16:
+        if isinstance(e.l, (ir.Var, ir.Reg)):
+            return e.l.name
+    return None
+
+
+def _seg_matches_far(seg, root_name):
+    if seg is None:
+        return True
+    return _seg_extracts_var(seg) == root_name
+
+
 class _Emit:
-    def __init__(self, namer, block_starts=frozenset(), hidden=frozenset(), user_renames=None, var_structs=None):
+    def __init__(self, namer, block_starts=frozenset(), hidden=frozenset(),
+                 user_renames=None, var_structs=None, far_vars=None):
         self.namer = namer
         self.block_starts = block_starts
         self.hidden = hidden
         self.user_renames = user_renames or {}
         self.var_structs = dict(var_structs or {})
+        self.far_vars = dict(far_vars or {})
         self.used_labels = set()
         self._pending = []
 
@@ -133,7 +218,7 @@ class _Emit:
                     n = self.namer._lookup(e.value)
                     if n:
                         return self.user_renames.get(n, n)
-            if e.width == "a":
+            if e.width == "a" and e.value >= 0x1000:
                 return "0x%05X" % e.value
             return str(e.value) if e.value < 10 else "0x%X" % e.value
         if isinstance(e, (ir.Reg, ir.Var)):
@@ -144,6 +229,8 @@ class _Emit:
             return "((%s >> %d) & 1)" % (self.expr(e.base, False), e.bit)
         if isinstance(e, ir.Bin):
             e = opt.simplify_math(e)
+            if not isinstance(e, ir.Bin):
+                return self.expr(e, top, parent_op, is_right)
             my_prec = _PRECEDENCE.get(e.op, 0)
             l_str = self.expr(e.l, False, e.op, False)
             r_str = self.expr(e.r, False, e.op, True)
@@ -158,7 +245,10 @@ class _Emit:
                     return "(%s)" % s
             return s
         if isinstance(e, ir.Un):
-            return "%s%s" % (e.op, self.expr(e.e, False))
+            inner = self.expr(e.e, False)
+            if isinstance(e.e, ir.Bin):
+                return "%s(%s)" % (e.op, inner)
+            return "%s%s" % (e.op, inner)
         if isinstance(e, ir.IntrExpr):
             if not e.args:
                 return e.name
@@ -186,10 +276,10 @@ class _Emit:
             return "%s(%s)" % (e.name, ", ".join(self.expr(a) for a in e.args))
         return "?"
 
-    def _is_global_addr(self, val, es=False):
+    def _is_global_addr(self, val, es=False, seg=None):
         if not isinstance(val, int):
             return False
-        if 0xF0000 <= val <= 0xFFFFF or 0xFE20 <= val <= 0xFFFF:
+        if 0x10000 <= val <= 0xFFFFF or 0xFE20 <= val <= 0xFFFF:
             return True
         if hasattr(self.namer, "cell_names") and val in self.namer.cell_names:
             return True
@@ -197,7 +287,8 @@ class _Emit:
             return True
         if sfr.name_for(val) is not None:
             return True
-        if es and 0x800 <= val < 0x80000:
+        is_rom_seg0 = isinstance(seg, ir.Const) and seg.value == 0
+        if (es or is_rom_seg0) and 0x1000 <= val < 0x10000:
             return True
         return False
 
@@ -216,8 +307,14 @@ class _Emit:
                     return f"{vname}->{mname}"
         return None
 
+    def _deref(self, ctype, expr_node):
+        s = self.expr(expr_node, False)
+        if isinstance(expr_node, (ir.Var, ir.Reg)):
+            return "*(%s *)%s" % (ctype, s)
+        return "*(%s *)(%s)" % (ctype, s)
+
     def _mem(self, e):
-        w = "16" if e.width == "w" else "8"
+        ctype = "uint16_t" if e.width == "w" else "uint8_t"
         if getattr(e, "name", None):
             return self.user_renames.get(e.name, e.name)
 
@@ -229,6 +326,23 @@ class _Emit:
         if isinstance(addr, ir.Const):
             addr = addr.value
 
+        seg = getattr(e, "seg", None)
+        if isinstance(seg, ir.Bin):
+            seg = opt.simplify_math(seg)
+        seg_val = (seg.value & 0xF) if isinstance(seg, ir.Const) else (seg & 0xF if isinstance(seg, int) else None)
+
+        # Constant segment + constant offset -> single 20-bit linear address symbol
+        if e.es and seg_val is not None and isinstance(addr, int):
+            linear = ((seg_val << 16) | (addr & 0xFFFF)) & 0xFFFFF
+            name = self.namer.cell(linear)
+            return self.user_renames.get(name, name)
+
+        # Already-20-bit far pointer (consolidated uint32_t param, uint32_t return, or derived pointer)
+        if isinstance(addr, ir.Expr):
+            far_root = _extract_far_base(addr, self.far_vars)
+            if far_root is not None and (not e.es or _seg_matches_far(seg, far_root)):
+                return self._deref(ctype, addr)
+
         # Check if addr is an addition of a base global address and an index
         if isinstance(addr, ir.Bin) and addr.op == "+":
             # Check if one side is an explicitly named constant
@@ -239,46 +353,67 @@ class _Emit:
                 base_name = self.user_renames.get(addr.r.name, addr.r.name)
                 return "%s[%s]" % (base_name, self.expr(addr.l))
 
+            if not e.es or seg_val is not None:
+                l_val = addr.l.value if isinstance(addr.l, ir.Const) else (addr.l if isinstance(addr.l, int) else None)
+                r_val = addr.r.value if isinstance(addr.r, ir.Const) else (addr.r if isinstance(addr.r, int) else None)
+
+                base_addr = None
+                idx_expr = None
+
+                if l_val is not None and self._is_global_addr(l_val, e.es, seg):
+                    if e.es and seg_val is not None:
+                        base_addr = ((seg_val << 16) | (l_val & 0xFFFF)) & 0xFFFFF
+                    else:
+                        base_addr = (0xF0000 | l_val) if (0xFE20 <= l_val <= 0xFFFF and seg is None) else l_val
+                    idx_expr = addr.r
+                elif r_val is not None and self._is_global_addr(r_val, e.es, seg):
+                    if e.es and seg_val is not None:
+                        base_addr = ((seg_val << 16) | (r_val & 0xFFFF)) & 0xFFFFF
+                    else:
+                        base_addr = (0xF0000 | r_val) if (0xFE20 <= r_val <= 0xFFFF and seg is None) else r_val
+                    idx_expr = addr.l
+
+                if base_addr is not None and idx_expr is not None:
+                    base_name = self.namer.cell(base_addr)
+                    base_name = self.user_renames.get(base_name, base_name)
+                    return "%s[%s]" % (base_name, self.expr(idx_expr))
+
+        if isinstance(addr, ir.Bin) and addr.op == "-" and (not e.es or seg_val is not None):
             l_val = addr.l.value if isinstance(addr.l, ir.Const) else (addr.l if isinstance(addr.l, int) else None)
-            r_val = addr.r.value if isinstance(addr.r, ir.Const) else (addr.r if isinstance(addr.r, int) else None)
-
-            base_addr = None
-            idx_expr = None
-
-            if l_val is not None and self._is_global_addr(l_val, e.es):
-                base_addr = (0xF0000 | l_val) if (0xFE20 <= l_val <= 0xFFFF and not e.es) else l_val
-                idx_expr = addr.r
-            elif r_val is not None and self._is_global_addr(r_val, e.es):
-                base_addr = (0xF0000 | r_val) if (0xFE20 <= r_val <= 0xFFFF and not e.es) else r_val
-                idx_expr = addr.l
-
-            if base_addr is not None and idx_expr is not None:
-                base_name = self.namer.cell(base_addr)
-                base_name = self.user_renames.get(base_name, base_name)
-                return "%s[%s]" % (base_name, self.expr(idx_expr))
-
-        if isinstance(addr, ir.Bin) and addr.op == "-":
-            l_val = addr.l.value if isinstance(addr.l, ir.Const) else (addr.l if isinstance(addr.l, int) else None)
-            if l_val is not None and self._is_global_addr(l_val, e.es):
-                base_addr = (0xF0000 | l_val) if (0xFE20 <= l_val <= 0xFFFF and not e.es) else l_val
+            if l_val is not None and self._is_global_addr(l_val, e.es, seg):
+                if e.es and seg_val is not None:
+                    base_addr = ((seg_val << 16) | (l_val & 0xFFFF)) & 0xFFFFF
+                else:
+                    base_addr = (0xF0000 | l_val) if (0xFE20 <= l_val <= 0xFFFF and seg is None) else l_val
                 base_name = self.namer.cell(base_addr)
                 base_name = self.user_renames.get(base_name, base_name)
                 return "%s[-(%s)]" % (base_name, self.expr(addr.r))
 
         if isinstance(addr, ir.Expr):
-            pre = "es_mem" if e.es else "mem"
-            return "%s%s[%s]" % (pre, w, self.expr(addr))
+            if e.es:
+                if seg_val is not None:
+                    if seg_val == 0:
+                        return self._deref(ctype, addr)
+                    off_str = self.expr(addr, False, "|", True)
+                    return "*(%s *)(0x%X0000 | %s)" % (ctype, seg_val, off_str)
+                if seg is not None:
+                    seg_str = self.expr(seg, False)
+                    if isinstance(seg, ir.Bin):
+                        seg_str = "(%s)" % seg_str
+                else:
+                    seg_str = "es"
+                off_str = self.expr(addr, False, "|", True)
+                return "*(%s *)(((uint32_t)%s << 16) | %s)" % (ctype, seg_str, off_str)
+            return self._deref(ctype, addr)
 
         if e.es:
-            full_addr = ((0xF0000 | addr) if addr < 0x10000 else addr)
-            if hasattr(self.namer, "_lookup"):
-                n = self.namer._lookup(full_addr) or self.namer._lookup(addr)
-                if n:
-                    return self.user_renames.get(n, n)
-            if hasattr(self.namer, "cell_names") and (full_addr in self.namer.cell_names or addr in self.namer.cell_names):
-                n = self.namer.cell(full_addr if full_addr in self.namer.cell_names else addr)
-                return self.user_renames.get(n, n)
-            return "es_mem%s[0x%04X]" % (w, addr & 0xFFFF)
+            if seg is not None:
+                seg_str = self.expr(seg, False)
+                if isinstance(seg, ir.Bin):
+                    seg_str = "(%s)" % seg_str
+            else:
+                seg_str = "es"
+            return "*(%s *)(((uint32_t)%s << 16) | 0x%04X)" % (ctype, seg_str, addr & 0xFFFF)
 
         name = self.namer.cell(addr)
         return self.user_renames.get(name, name)
@@ -428,8 +563,10 @@ def generate(func, tree, namer, frame_info=None, sig=None, banner=None,
     struct_defs = getattr(namer, "struct_defs", {}) or {}
     symbol_structs = getattr(namer, "symbol_structs", {}) or {}
     var_structs = _infer_struct_pointers(func, struct_defs, symbol_structs, user_types=u_types, sig=sig)
+    far_vars = _infer_far_pointers(func, sig=sig, frame_info=frame_info)
 
-    em = _Emit(namer, block_starts=frozenset(func.blocks), hidden=hidden, user_renames=u_renames, var_structs=var_structs)
+    em = _Emit(namer, block_starts=frozenset(func.blocks), hidden=hidden,
+               user_renames=u_renames, var_structs=var_structs, far_vars=far_vars)
     em.emit(tree, 1)
     body, body_eas = em.flush()
     out = CodeLines()
@@ -466,7 +603,7 @@ def generate(func, tree, namer, frame_info=None, sig=None, banner=None,
     if frame_info and frame_info.locals:
         for name, (var, width) in sorted(frame_info.locals.items(), key=lambda kv: kv[1][0].offset):
             eff_name = u_renames.get(name, name)
-            default_t = "uint32_t" if width == "d" else ("uint16_t" if width == "w" else "uint8_t")
+            default_t = "uint32_t" if (width == "d" or name in far_vars) else ("uint16_t" if width == "w" else "uint8_t")
             if name in var_structs:
                 default_t = f"{var_structs[name]} *"
             tstr = u_types.get(name, u_types.get(eff_name, default_t))
@@ -482,7 +619,7 @@ def generate(func, tree, namer, frame_info=None, sig=None, banner=None,
             if frame_info.locals and name in frame_info.locals:
                 continue
             eff_name = u_renames.get(name, name)
-            default_t = "uint32_t" if width == "d" else ("uint16_t" if width == "w" else "uint8_t")
+            default_t = "uint32_t" if (width == "d" or name in far_vars) else ("uint16_t" if width == "w" else "uint8_t")
             if name in var_structs:
                 default_t = f"{var_structs[name]} *"
             tstr = u_types.get(name, u_types.get(eff_name, default_t))

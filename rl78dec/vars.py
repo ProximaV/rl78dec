@@ -110,8 +110,11 @@ def _collect_expr_atoms(e, out):
     elif isinstance(e, ir.IntrExpr):
         for a in e.args:
             _collect_expr_atoms(a, out)
-    elif isinstance(e, ir.Mem) and isinstance(e.addr, ir.Expr):
-        _collect_expr_atoms(e.addr, out)
+    elif isinstance(e, ir.Mem):
+        if isinstance(e.addr, ir.Expr):
+            _collect_expr_atoms(e.addr, out)
+        if isinstance(e.seg, ir.Expr):
+            _collect_expr_atoms(e.seg, out)
 
 
 def _get_stmt_uses(s):
@@ -119,8 +122,11 @@ def _get_stmt_uses(s):
     uses = []
     if isinstance(s, ir.Assign):
         _collect_expr_atoms(s.src, uses)
-        if isinstance(s.dst, ir.Mem) and isinstance(s.dst.addr, ir.Expr):
-            _collect_expr_atoms(s.dst.addr, uses)
+        if isinstance(s.dst, ir.Mem):
+            if isinstance(s.dst.addr, ir.Expr):
+                _collect_expr_atoms(s.dst.addr, uses)
+            if isinstance(s.dst.seg, ir.Expr):
+                _collect_expr_atoms(s.dst.seg, uses)
     elif isinstance(s, ir.Swap):
         _collect_expr_atoms(s.a, uses)
         _collect_expr_atoms(s.b, uses)
@@ -198,8 +204,9 @@ def _expr_uses_var(e, var_name):
         return _expr_uses_var(e.base, var_name)
     if isinstance(e, ir.IntrExpr):
         return any(_expr_uses_var(a, var_name) for a in e.args)
-    if isinstance(e, ir.Mem) and isinstance(e.addr, ir.Expr):
-        return _expr_uses_var(e.addr, var_name)
+    if isinstance(e, ir.Mem):
+        return ((isinstance(e.addr, ir.Expr) and _expr_uses_var(e.addr, var_name)) or
+                (isinstance(e.seg, ir.Expr) and _expr_uses_var(e.seg, var_name)))
     return False
 
 
@@ -236,10 +243,10 @@ def _subst_ast(e, repl_map):
             return ir.IntrExpr(e.name, new_args)
         return e
     if isinstance(e, ir.Mem):
-        if isinstance(e.addr, ir.Expr):
-            na = _subst_ast(e.addr, repl_map)
-            if na is not e.addr:
-                return ir.Mem(na, e.width, e.es, e.name)
+        na = _subst_ast(e.addr, repl_map) if isinstance(e.addr, ir.Expr) else e.addr
+        ns = _subst_ast(e.seg, repl_map) if isinstance(e.seg, ir.Expr) else e.seg
+        if na is not e.addr or ns is not e.seg:
+            return ir.Mem(na, e.width, e.es, e.name, ns)
         return e
     return e
 
@@ -252,9 +259,12 @@ def _subst_stmt_var(s, var_name, target_expr, seen_flags=None):
         if _expr_uses_var(s.src, var_name):
             s.src = _subst_ast(s.src, repl)
             changed = True
-        if isinstance(s.dst, ir.Mem) and isinstance(s.dst.addr, ir.Expr):
-            if _expr_uses_var(s.dst.addr, var_name):
+        if isinstance(s.dst, ir.Mem):
+            if isinstance(s.dst.addr, ir.Expr) and _expr_uses_var(s.dst.addr, var_name):
                 s.dst.addr = _subst_ast(s.dst.addr, repl)
+                changed = True
+            if isinstance(s.dst.seg, ir.Expr) and _expr_uses_var(s.dst.seg, var_name):
+                s.dst.seg = _subst_ast(s.dst.seg, repl)
                 changed = True
     elif isinstance(s, ir.Call):
         new_args = []
@@ -397,13 +407,23 @@ def _compute_var_counts(func, hidden):
                 elif isinstance(e, ir.IntrExpr):
                     for a in e.args:
                         count_vars(a)
-                elif isinstance(e, ir.Mem) and isinstance(e.addr, ir.Expr):
-                    count_vars(e.addr)
+                elif isinstance(e, ir.Mem):
+                    if isinstance(e.addr, ir.Expr):
+                        count_vars(e.addr)
+                    if isinstance(e.seg, ir.Expr):
+                        count_vars(e.seg)
+                    elif e.es and e.seg is None:
+                        use_count["es"] = use_count.get("es", 0) + 1
 
             if isinstance(s, ir.Assign):
                 count_vars(s.src)
-                if isinstance(s.dst, ir.Mem) and isinstance(s.dst.addr, ir.Expr):
-                    count_vars(s.dst.addr)
+                if isinstance(s.dst, ir.Mem):
+                    if isinstance(s.dst.addr, ir.Expr):
+                        count_vars(s.dst.addr)
+                    if isinstance(s.dst.seg, ir.Expr):
+                        count_vars(s.dst.seg)
+                    elif s.dst.es and s.dst.seg is None:
+                        use_count["es"] = use_count.get("es", 0) + 1
                 if isinstance(s.dst, ir.Var):
                     def_count[s.dst.name] = def_count.get(s.dst.name, 0) + 1
             elif isinstance(s, ir.Call):
@@ -476,13 +496,19 @@ def _compute_var_liveness(func, hidden):
                 elif isinstance(e, ir.IntrExpr):
                     for a in e.args:
                         collect_v(a)
-                elif isinstance(e, ir.Mem) and isinstance(e.addr, ir.Expr):
-                    collect_v(e.addr)
+                elif isinstance(e, ir.Mem):
+                    if isinstance(e.addr, ir.Expr):
+                        collect_v(e.addr)
+                    if isinstance(e.seg, ir.Expr):
+                        collect_v(e.seg)
 
             if isinstance(s, ir.Assign):
                 collect_v(s.src)
-                if isinstance(s.dst, ir.Mem) and isinstance(s.dst.addr, ir.Expr):
-                    collect_v(s.dst.addr)
+                if isinstance(s.dst, ir.Mem):
+                    if isinstance(s.dst.addr, ir.Expr):
+                        collect_v(s.dst.addr)
+                    if isinstance(s.dst.seg, ir.Expr):
+                        collect_v(s.dst.seg)
             elif isinstance(s, ir.Call):
                 for a in s.args:
                     collect_v(a)
@@ -551,8 +577,11 @@ def _stmt_uses_var_check(s, var_name, seen_flags=None):
     if isinstance(s, ir.Assign):
         if _expr_uses_var(s.src, var_name):
             return True
-        if isinstance(s.dst, ir.Mem) and isinstance(s.dst.addr, ir.Expr) and _expr_uses_var(s.dst.addr, var_name):
-            return True
+        if isinstance(s.dst, ir.Mem):
+            if isinstance(s.dst.addr, ir.Expr) and _expr_uses_var(s.dst.addr, var_name):
+                return True
+            if isinstance(s.dst.seg, ir.Expr) and _expr_uses_var(s.dst.seg, var_name):
+                return True
     elif isinstance(s, ir.Call):
         if any(_expr_uses_var(a, var_name) for a in s.args):
             return True
@@ -594,9 +623,12 @@ def _stmt_modifies_target(s, target):
     if isinstance(s, (ir.Assign, ir.Call)) and s.dst is not None:
         if s.dst == target:
             return True
-        if isinstance(target, ir.Mem) and isinstance(target.addr, ir.Expr):
-            if isinstance(s.dst, (ir.Var, ir.Reg)) and _expr_uses_var(target.addr, s.dst.name):
-                return True
+        if isinstance(target, ir.Mem):
+            if isinstance(s.dst, (ir.Var, ir.Reg)):
+                if isinstance(target.addr, ir.Expr) and _expr_uses_var(target.addr, s.dst.name):
+                    return True
+                if isinstance(target.seg, ir.Expr) and _expr_uses_var(target.seg, s.dst.name):
+                    return True
         if isinstance(target, ir.Mem) and isinstance(s.dst, ir.Mem):
             return True
     if isinstance(s, ir.Call):
@@ -649,8 +681,11 @@ def _fold_temp_copies(func, hidden):
             if not (isinstance(s_copy, ir.Assign) and s_copy.flag is None and s_copy.src == v):
                 return False
             target = s_copy.dst
-            if isinstance(target, ir.Mem) and isinstance(target.addr, ir.Expr) and _expr_uses_var(target.addr, v.name):
-                return False
+            if isinstance(target, ir.Mem):
+                if isinstance(target.addr, ir.Expr) and _expr_uses_var(target.addr, v.name):
+                    return False
+                if isinstance(target.seg, ir.Expr) and _expr_uses_var(target.seg, v.name):
+                    return False
 
             if u_cnt > 1:
                 if v.name in live_out.get(b_use.start, set()):
@@ -826,6 +861,153 @@ def _inline_single_use(func, hidden):
     return changed
 
 
+def _collapse_split_far_mems(func, hidden):
+    """Collapse split 32-bit far pointer accesses where seg=(uint8_t)(v >> 16) and addr=(uint16_t)v (+ off)
+    into a unified 20-bit Mem(v + off, es=False, seg=None)."""
+    _, def_count = _compute_var_counts(func, hidden)
+
+    # Track single-def low-16-bit aliases: v1 = (uint16_t)v0 where v0 is single-def/param
+    low16_aliases = {}
+    for b in func.blocks.values():
+        for s in b.stmts:
+            if id(s) in hidden:
+                continue
+            if (isinstance(s, ir.Assign) and isinstance(s.dst, ir.Var) and
+                    def_count.get(s.dst.name, 0) == 1 and
+                    isinstance(s.src, ir.Un) and s.src.op == "(uint16_t)" and
+                    isinstance(s.src.e, ir.Var) and def_count.get(s.src.e.name, 0) <= 1):
+                low16_aliases[s.dst.name] = s.src.e
+
+    def _extract_seg_var(seg, scratch_map=None):
+        if isinstance(seg, ir.Mem) and not seg.es and scratch_map:
+            raw = seg.addr if isinstance(seg.addr, int) else (
+                seg.addr.value if isinstance(seg.addr, ir.Const) else None
+            )
+            if raw in scratch_map:
+                return scratch_map[raw]
+        e = seg
+        if isinstance(e, ir.Un) and e.op in ("(uint8_t)", "(uint16_t)"):
+            e = e.e
+        if isinstance(e, ir.Bin) and e.op == ">>" and isinstance(e.r, ir.Const) and e.r.value == 16:
+            if isinstance(e.l, ir.Var):
+                return e.l
+        return None
+
+    def _recombine_addr(addr, seg_var):
+        if isinstance(addr, ir.Un) and addr.op == "(uint16_t)" and isinstance(addr.e, ir.Var):
+            if addr.e.name == seg_var.name:
+                return seg_var
+        if isinstance(addr, ir.Var):
+            if addr.name == seg_var.name:
+                return seg_var
+            ali = low16_aliases.get(addr.name)
+            if ali is not None and ali.name == seg_var.name:
+                return seg_var
+        if isinstance(addr, ir.Bin) and addr.op == "+":
+            nl = _recombine_addr(addr.l, seg_var)
+            if nl is not None:
+                return ir.Bin("+", nl, addr.r)
+            nr = _recombine_addr(addr.r, seg_var)
+            if nr is not None:
+                return ir.Bin("+", addr.l, nr)
+        if isinstance(addr, ir.Bin) and addr.op == "-":
+            nl = _recombine_addr(addr.l, seg_var)
+            if nl is not None:
+                return ir.Bin("-", nl, addr.r)
+        return None
+
+    changed = False
+
+    def _rw(e, scratch_map):
+        nonlocal changed
+        if isinstance(e, ir.Mem):
+            na = _rw(e.addr, scratch_map) if isinstance(e.addr, ir.Expr) else e.addr
+            ns = _rw(e.seg, scratch_map) if isinstance(e.seg, ir.Expr) else e.seg
+            if e.es and ns is not None:
+                sv = _extract_seg_var(ns, scratch_map)
+                if sv is not None and isinstance(na, ir.Expr):
+                    recomb = _recombine_addr(na, sv)
+                    if recomb is not None:
+                        changed = True
+                        return ir.Mem(recomb, e.width, es=False, name=e.name, seg=None)
+            if na is not e.addr or ns is not e.seg:
+                return ir.Mem(na, e.width, e.es, e.name, ns)
+            return e
+        if isinstance(e, ir.Bin):
+            nl = _rw(e.l, scratch_map)
+            nr = _rw(e.r, scratch_map)
+            if nl is not e.l or nr is not e.r:
+                return ir.Bin(e.op, nl, nr)
+            return e
+        if isinstance(e, ir.Un):
+            ne = _rw(e.e, scratch_map)
+            if ne is not e.e:
+                return ir.Un(e.op, ne)
+            return e
+        if isinstance(e, ir.Bit):
+            nb = _rw(e.base, scratch_map)
+            if nb is not e.base:
+                return ir.Bit(nb, e.bit)
+            return e
+        if isinstance(e, ir.IntrExpr):
+            new_args = [_rw(a, scratch_map) for a in e.args]
+            if any(na is not oa for na, oa in zip(new_args, e.args)):
+                return ir.IntrExpr(e.name, new_args)
+            return e
+        return e
+
+    for b in func.blocks.values():
+        scratch_map = {}
+        for s in b.stmts:
+            if id(s) in hidden:
+                continue
+            if isinstance(s, ir.Assign):
+                s.dst = _rw(s.dst, scratch_map)
+                s.src = _rw(s.src, scratch_map)
+                if isinstance(s.dst, ir.Mem):
+                    raw = None if s.dst.es else (s.dst.addr if isinstance(s.dst.addr, int) else (
+                        s.dst.addr.value if isinstance(s.dst.addr, ir.Const) else None
+                    ))
+                    if raw is None:
+                        scratch_map.clear()
+                    elif 0xFFE20 <= raw <= 0xFFEFF and s.dst.width == "b":
+                        sv = _extract_seg_var(s.src, scratch_map)
+                        if sv is not None:
+                            scratch_map[raw] = sv
+                        else:
+                            scratch_map.pop(raw, None)
+                elif isinstance(s.dst, ir.Var):
+                    for k in [k for k, v in scratch_map.items() if v.name == s.dst.name]:
+                        scratch_map.pop(k, None)
+            elif isinstance(s, ir.Compare) and s.flag:
+                if s.flag.a:
+                    s.flag.a = _rw(s.flag.a, scratch_map)
+                if s.flag.b:
+                    s.flag.b = _rw(s.flag.b, scratch_map)
+            elif isinstance(s, ir.Branch):
+                if isinstance(s.cond, ir.Expr):
+                    s.cond = _rw(s.cond, scratch_map)
+                if s.flag:
+                    if s.flag.a:
+                        s.flag.a = _rw(s.flag.a, scratch_map)
+                    if s.flag.b:
+                        s.flag.b = _rw(s.flag.b, scratch_map)
+                if s.bittest and isinstance(s.bittest[0], ir.Expr):
+                    s.bittest = (_rw(s.bittest[0], scratch_map), s.bittest[1])
+            elif isinstance(s, ir.Call):
+                s.args = [_rw(a, scratch_map) for a in s.args]
+                if s.expr:
+                    s.expr = _rw(s.expr, scratch_map)
+                scratch_map.clear()
+            elif isinstance(s, ir.Intrinsic):
+                s.args = [_rw(a, scratch_map) for a in s.args]
+            elif isinstance(s, ir.Ret) and s.val:
+                s.val = _rw(s.val, scratch_map)
+            elif isinstance(s, ir.Switch) and s.expr:
+                s.expr = _rw(s.expr, scratch_map)
+    return changed
+
+
 def _eliminate_dead_assignments(func, hidden, sig=None):
     """Eliminate dead assignments to registers, unused segment registers (ES/CS), and unused virtual variables."""
     protected_atoms = set()
@@ -847,26 +1029,32 @@ def _eliminate_dead_assignments(func, hidden, sig=None):
                 if id(s) in hidden:
                     new_stmts.append(s)
                     continue
-                if isinstance(s, ir.Assign) and s.flag is None and _is_pure_expr(s.src):
-                    # Check segment registers (es, cs)
+                if isinstance(s, ir.Assign) and s.flag is None:
+                    # Check segment registers (es, cs) -- also allow eliminating non-SFR mem loads
                     if isinstance(s.dst, ir.Reg) and s.dst.name in ("es", "cs"):
                         if use_count.get(s.dst.name, 0) == 0:
-                            changed = True
-                            any_changed = True
-                            continue
-                    # Check GPRs
-                    elif isinstance(s.dst, ir.Reg) and s.dst.name in ALL_GPR:
-                        atoms = ATOM_PAIRS.get(s.dst.name, (s.dst.name,))
-                        if all(use_count.get(a, 0) == 0 for a in atoms) and not any(a in protected_atoms for a in atoms):
-                            changed = True
-                            any_changed = True
-                            continue
-                    # Check compiler-generated virtual variables (v0, v1, ...)
-                    elif isinstance(s.dst, ir.Var) and _is_vvar(s.dst.name):
-                        if use_count.get(s.dst.name, 0) == 0:
-                            changed = True
-                            any_changed = True
-                            continue
+                            is_non_sfr_mem = (
+                                isinstance(s.src, ir.Mem) and not s.src.es and
+                                isinstance(s.src.addr, int) and s.src.addr < 0xFFF00
+                            )
+                            if _is_pure_expr(s.src) or is_non_sfr_mem:
+                                changed = True
+                                any_changed = True
+                                continue
+                    if _is_pure_expr(s.src):
+                        # Check GPRs
+                        if isinstance(s.dst, ir.Reg) and s.dst.name in ALL_GPR:
+                            atoms = ATOM_PAIRS.get(s.dst.name, (s.dst.name,))
+                            if all(use_count.get(a, 0) == 0 for a in atoms) and not any(a in protected_atoms for a in atoms):
+                                changed = True
+                                any_changed = True
+                                continue
+                        # Check compiler-generated virtual variables (v0, v1, ...)
+                        elif isinstance(s.dst, ir.Var) and _is_vvar(s.dst.name):
+                            if use_count.get(s.dst.name, 0) == 0:
+                                changed = True
+                                any_changed = True
+                                continue
                 elif isinstance(s, ir.Call) and s.dst and isinstance(s.dst, ir.Var) and _is_vvar(s.dst.name):
                     if use_count.get(s.dst.name, 0) == 0:
                         s.dst = None
@@ -992,9 +1180,9 @@ def recover_variables(func, sig, frame_info):
     if sig and sig.params:
         for p in sig.params:
             if p.location in ("ax", "a"):
-                param_map["a0"] = ("x", "a", p.type_str == "uint16_t")
+                param_map[p.name] = ("x", "a", p.location == "ax")
             elif p.location in ("bc", "c"):
-                param_map["a1"] = ("c", "b", p.type_str == "uint16_t")
+                param_map[p.name] = ("c", "b", p.location == "bc")
 
     for root, members in groups.items():
         is_dword = any(m in dword_nodes for m in members)
@@ -1063,8 +1251,11 @@ def recover_variables(func, sig, frame_info):
 
             if isinstance(s, ir.Assign):
                 s.src = _subst_ast(s.src, uses_repl)
-                if isinstance(s.dst, ir.Mem) and isinstance(s.dst.addr, ir.Expr):
-                    s.dst.addr = _subst_ast(s.dst.addr, uses_repl)
+                if isinstance(s.dst, ir.Mem):
+                    if isinstance(s.dst.addr, ir.Expr):
+                        s.dst.addr = _subst_ast(s.dst.addr, uses_repl)
+                    if isinstance(s.dst.seg, ir.Expr):
+                        s.dst.seg = _subst_ast(s.dst.seg, uses_repl)
                 elif dst_var is not None:
                     if s.flag is not None and s.flag.kind == "result" and s.flag.a == s.dst:
                         s.flag.a = dst_var
@@ -1114,14 +1305,16 @@ def recover_variables(func, sig, frame_info):
             new_stmts.append(s)
         b.stmts = new_stmts
 
-    # 5. Optimize: Dead Code Cleanup, Temporary Copy Folding, and Single-Use Inlining
+    # 5. Optimize: Split Far-Pointer Collapse, Dead Code Cleanup, Copy Folding, Single-Use Inlining
     for _ in range(10):
+        c0 = _collapse_split_far_mems(func, hidden)
         c1 = _eliminate_dead_compares(func, hidden)
         c2 = _eliminate_dead_assignments(func, hidden, sig=sig)
         c3 = _fold_temp_copies(func, hidden)
         c4 = _inline_single_use(func, hidden)
-        if not (c1 or c2 or c3 or c4):
+        if not (c0 or c1 or c2 or c3 or c4):
             break
+    _collapse_split_far_mems(func, hidden)
     _eliminate_dead_compares(func, hidden)
     _eliminate_dead_assignments(func, hidden, sig=sig)
 
@@ -1141,8 +1334,11 @@ def recover_variables(func, sig, frame_info):
         elif isinstance(e, ir.IntrExpr):
             for a in e.args:
                 _collect_vvar(a)
-        elif isinstance(e, ir.Mem) and isinstance(e.addr, ir.Expr):
-            _collect_vvar(e.addr)
+        elif isinstance(e, ir.Mem):
+            if isinstance(e.addr, ir.Expr):
+                _collect_vvar(e.addr)
+            if isinstance(e.seg, ir.Expr):
+                _collect_vvar(e.seg)
 
     for b in func.blocks.values():
         for s in b.stmts:
