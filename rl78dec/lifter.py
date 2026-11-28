@@ -76,19 +76,27 @@ def lift_insn(ins):
     # --- arithmetic / logic ------------------------------------------------
     if m in _ALU:
         dst, src = e(0), e(1)
+        cy_op = None
         if m == "addc":
             rhs = ir.Bin("+", ir.Bin("+", dst, src), ir.Reg("cy"))
             flag = ir.FlagDef("result", a=dst)
+            cy_op = "addc"
         elif m == "subc":
             rhs = ir.Bin("-", ir.Bin("-", dst, src), ir.Reg("cy"))
             flag = ir.FlagDef("sub", a=dst, b=src)
+            cy_op = "subc"
         elif m in ("sub", "subw"):
             rhs = ir.Bin("-", dst, src)
             flag = ir.FlagDef("sub", a=dst, b=src)
+            cy_op = m
+        elif m in ("add", "addw"):
+            rhs = ir.Bin("+", dst, src)
+            flag = ir.FlagDef("result", a=dst)
+            cy_op = m
         else:
             rhs = ir.Bin(_ALU[m], dst, src)
             flag = ir.FlagDef("result", a=dst)
-        return [ir.Assign(ea, dst, rhs, flag=flag)]
+        return [ir.Assign(ea, dst, rhs, flag=flag, cy_op=cy_op)]
     if m in ("cmp", "cmpw", "cmps"):
         return [ir.Compare(ea, ir.FlagDef("cmp", a=e(0), b=e(1)))]
     if m == "cmp0":
@@ -108,13 +116,15 @@ def lift_insn(ins):
 
     # --- shifts / rotates --------------------------------------------------
     if m in ("shl", "shlw"):
-        return [ir.Assign(ea, e(0), ir.Bin("<<", e(0), e(1)))]
+        return [ir.Assign(ea, e(0), ir.Bin("<<", e(0), e(1)), cy_op=m)]
     if m in ("shr", "shrw"):
-        return [ir.Assign(ea, e(0), ir.Bin(">>", e(0), e(1)))]
+        return [ir.Assign(ea, e(0), ir.Bin(">>", e(0), e(1)), cy_op=m)]
     if m in ("sar", "sarw"):
-        return [ir.Assign(ea, e(0), ir.IntrExpr("sar", [e(0), e(1)]))]
-    if m in ("ror", "rol", "rorc", "rolc", "rolwc"):
-        return [ir.Assign(ea, e(0), ir.IntrExpr(m, [e(0)]))]
+        return [ir.Assign(ea, e(0), ir.IntrExpr(m, [e(0), e(1)]), cy_op=m)]
+    if m in ("ror", "rol"):
+        return [ir.Assign(ea, e(0), ir.IntrExpr(m, [e(0)]), cy_op=m)]
+    if m in ("rorc", "rolc", "rolwc"):
+        return [ir.Assign(ea, e(0), ir.IntrExpr(m, [e(0), ir.Reg("cy")]), cy_op=m)]
 
     # --- bit ---------------------------------------------------------------
     if m in ("set1", "clr1", "not1"):

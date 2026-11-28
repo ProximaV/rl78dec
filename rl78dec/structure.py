@@ -54,6 +54,15 @@ def cond_expr(branch):
         return ir.IntrExpr(_FLAG[c], [])
     if flag.kind in ("cmp", "sub", "cmp0"):
         return ir.Bin(_REL[c], flag.a, flag.b)
+    if flag.kind == "cy":
+        if c == "cy":
+            if isinstance(flag.a, ir.Bin) and flag.a.op in _NEG:
+                return flag.a
+            return ir.Bin("!=", flag.a, ir.Const(0))
+        if c == "ncy":
+            if isinstance(flag.a, ir.Bin) and flag.a.op in _NEG:
+                return negate(flag.a)
+            return ir.Bin("==", flag.a, ir.Const(0))
     if flag.kind == "result":
         if c in ("z", "nz"):
             return ir.Bin(_REL[c], flag.a, ir.Const(0))

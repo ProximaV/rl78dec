@@ -492,6 +492,94 @@ def test_es_20bit_resolution_and_formatting():
     print("ok  test_es_20bit_resolution_and_formatting")
 
 
+def test_carry_rotates_and_swap4():
+    # 1. Real RL78 32x32 multiply routine (swap4 @ 0x21C4):
+    #    xchw ax,de; shrw ax,#1; xchw ax,de; rorc a,#1; xch a,x; rorc a,#1; xch a,x; bnc ...
+    #    addw ax,bc; ... sknc; incw ax; ... shlw bc,#1; xchw ax,hl; rolwc ax,#1; xchw ax,hl
+    swap4_bytes = bytes.fromhex(
+        "c3c5c7fadadad814f6bdd8bddaaddccddc2035311e3561fb0861fb08de0fc1add803bdd8adda61d8a107bddac0311c3761ee37b4dcdfdbc6c4c2d7"
+    )
+    buf = bytearray(0x3000)
+    buf[0x21C4:0x21C4 + len(swap4_bytes)] = swap4_bytes
+    prog = decompile_image(
+        buf,
+        entries=[0x21C4],
+        cell_names={0xFFED8: "tmp_buf0", 0xFFEDA: "tmp_buf1", 0xFFEDC: "tmp_buf2"},
+        code_names={0x21C4: "swap4"},
+    )
+    t_swap4 = "\n".join(prog.funcs[0x21C4].lines)
+    assert "CY" not in t_swap4, t_swap4
+    assert "<< 7" not in t_swap4, t_swap4
+    assert "<< 0xF)" in t_swap4, t_swap4
+    assert "> 0xFFFF" in t_swap4, t_swap4
+    assert ">> 0xF) & 1)" in t_swap4, t_swap4
+
+    # 2. mov1 cy, mem.bit ; clrb a ; rolc a, #1 ; shrw ax, #8 ; movw bc, ax ; ret  (sub_7909 pattern)
+    #    71 54 E0     mov1 cy, saddr_E0.5  (0xFFEE0.5)
+    #    F1           clrb a
+    #    61 DC        rolc a, #1
+    #    31 8E        shrw ax, #8
+    #    12           movw bc, ax
+    #    D7           ret
+    raw_rolc = bytes([0x71, 0x54, 0xE0, 0xF1, 0x61, 0xDC, 0x31, 0x8E, 0x12, 0xD7])
+    prog_rolc = decompile_image(_img(raw_rolc), entries=[0], cell_names={0xFFEE0: "usbinfo1"})
+    t_rolc = "\n".join(prog_rolc.funcs[0].lines)
+    assert "return ((usbinfo1 >> 5) & 1);" in t_rolc, t_rolc
+    assert "CY" not in t_rolc, t_rolc
+
+    # 3. rorc a, #1 feeding mov1 mem.bit, cy (sub_82C2 pattern)
+    #    61 FB        rorc a, #1
+    #    71 51 E0     mov1 saddr_E0.5, cy
+    #    D7           ret
+    raw_rorc_cy = bytes([0x61, 0xFB, 0x71, 0x51, 0xE0, 0xD7])
+    prog_rorc_cy = decompile_image(_img(raw_rorc_cy), entries=[0], cell_names={0xFFEE0: "flags0"})
+    t_rorc_cy = "\n".join(prog_rorc_cy.funcs[0].lines)
+    assert "set_bit(flags0, 5, a0 & 1);" in t_rorc_cy, t_rorc_cy
+    assert "CY" not in t_rorc_cy, t_rorc_cy
+
+    # 4. shlw bc, #1 ; rolwc ax, #1 ; movw bc, ax ; ret (32-bit left shift / sub_221D / endian1 pattern)
+    #    31 1C        shlw bc, #1
+    #    61 EE        rolwc ax, #1
+    #    12           movw bc, ax
+    #    D7           ret
+    raw_shl32 = bytes([0x31, 0x1C, 0x61, 0xEE, 0x12, 0xD7])
+    prog_shl32 = decompile_image(_img(raw_shl32), entries=[0])
+    t_shl32 = "\n".join(prog_shl32.funcs[0].lines)
+    assert "(a0 << 1) | ((a1 >> 0xF) & 1)" in t_shl32, t_shl32
+    assert "CY" not in t_shl32, t_shl32
+
+    # 5a. set1 cy ; skc (61 C8) ; clr1 cy ; rolwc ax, #1 ; ret (skc skips clr1 cy -> CY=1)
+    raw_skc = bytes([0x71, 0x80, 0x61, 0xC8, 0x71, 0x88, 0x61, 0xEE, 0xD7])
+    prog_skc = decompile_image(_img(raw_skc), entries=[0])
+    t_skc = "\n".join(prog_skc.funcs[0].lines)
+    assert "(a0 << 1) | 1" in t_skc, t_skc
+    assert "CY" not in t_skc, t_skc
+
+    # 5b. set1 cy ; sknc (61 D8) ; clr1 cy ; rolwc ax, #1 ; ret (sknc falls through -> CY=0)
+    raw_sknc = bytes([0x71, 0x80, 0x61, 0xD8, 0x71, 0x88, 0x61, 0xEE, 0xD7])
+    prog_sknc = decompile_image(_img(raw_sknc), entries=[0])
+    t_sknc = "\n".join(prog_sknc.funcs[0].lines)
+    assert "return a0 << 1;" in t_sknc, t_sknc
+    assert "CY" not in t_sknc, t_sknc
+
+    # 6. mov1 cy, [hl].4 ; pop hl ; bnc +2 ; onew bc ; ret ; clrw bc ; ret (sub_6C06 pattern)
+    #    36 F0 00     movw hl, #00F0h (PER0)
+    #    71 C4        mov1 cy, [hl].4
+    #    C6           pop hl
+    #    DE 02        bnc +2
+    #    E7           onew bc
+    #    D7           ret
+    #    F7           clrw bc
+    #    D7           ret
+    raw_pop_cy = bytes([0x36, 0xF0, 0x00, 0x71, 0xC4, 0xC6, 0xDE, 0x02, 0xE7, 0xD7, 0xF7, 0xD7])
+    prog_pop_cy = decompile_image(_img(raw_pop_cy), entries=[0], cell_names={0xF00F0: "PER0"})
+    t_pop_cy = "\n".join(prog_pop_cy.funcs[0].lines)
+    assert "((PER0 >> 4) & 1)" in t_pop_cy, t_pop_cy
+    assert "CY" not in t_pop_cy, t_pop_cy
+
+    print("ok  test_carry_rotates_and_swap4")
+
+
 if __name__ == "__main__":
     test_decode_fields()
     test_all_first_bytes()
@@ -504,4 +592,5 @@ if __name__ == "__main__":
     test_math_simplification()
     test_brk_and_callt_semantics()
     test_es_20bit_resolution_and_formatting()
+    test_carry_rotates_and_swap4()
     print("\nall tests passed")

@@ -172,26 +172,58 @@ def _resolve_flags(f):
         for _, tgt in b.succ:
             preds.setdefault(tgt, []).append(b.start)
 
+    _CY_SENTINEL = object()
+
     def scan(block, incoming):
-        cur = incoming
+        cur_z, cur_cy = incoming
         for s in block.stmts:
             if isinstance(s, ir.Compare):
-                cur = s.flag
-            elif isinstance(s, ir.Assign) and s.flag is not None:
-                cur = s.flag
+                cur_z = s.flag
+                cur_cy = s.flag
+            elif isinstance(s, ir.Assign):
+                if s.flag is not None:
+                    cur_z = s.flag
+                if isinstance(s.dst, ir.Reg) and s.dst.name == "cy":
+                    cur_cy = _CY_SENTINEL
+                elif getattr(s, "cy_op", None) is not None:
+                    if s.cy_op in ("sub", "subw") and s.flag is not None:
+                        cur_cy = s.flag
+                    else:
+                        cur_cy = _CY_SENTINEL
             elif isinstance(s, ir.Branch) and s.cond is not None:
-                s.flag = cur
-            elif isinstance(s, (ir.Call, ir.Intrinsic)):
-                cur = None                    # a call clobbers flags
-        return cur
+                if s.cond in ("z", "nz"):
+                    s.flag = cur_z
+                elif s.cond in ("cy", "ncy"):
+                    if cur_cy is _CY_SENTINEL:
+                        s.flag = ir.FlagDef("cy", a=ir.Reg("cy"))
+                    else:
+                        s.flag = cur_cy
+                elif s.cond in ("h", "nh"):
+                    s.flag = cur_z if (cur_z is cur_cy and cur_cy is not _CY_SENTINEL) else None
+                else:
+                    s.flag = cur_z
+            elif isinstance(s, ir.Call):
+                cur_z = None
+                cur_cy = None
+            elif isinstance(s, ir.Intrinsic):
+                if s.name in ("push", "nop", "ei", "di", "sel", "set_bit", "clr_bit"):
+                    pass
+                elif s.name == "pop":
+                    if s.args and isinstance(s.args[0], ir.Reg) and s.args[0].name == "psw":
+                        cur_z = None
+                        cur_cy = None
+                else:
+                    cur_z = None
+                    cur_cy = None
+        return (cur_z, cur_cy)
 
     for _ in range(4):
         changed = False
         for b in f.ordered():
             pl = preds.get(b.start, [])
-            incoming = flag_out.get(pl[0]) if len(pl) == 1 else None
+            incoming = flag_out.get(pl[0], (None, None)) if len(pl) == 1 else (None, None)
             out = scan(b, incoming)
-            if flag_out.get(b.start) is not out:
+            if flag_out.get(b.start) != out:
                 flag_out[b.start] = out
                 changed = True
         if not changed:

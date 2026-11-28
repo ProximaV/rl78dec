@@ -239,6 +239,10 @@ class _Emit:
                 p_prec = _PRECEDENCE.get(parent_op, 0)
                 if parent_op in ("<<", ">>", "&", "|", "^") and e.op in ("+", "-", "*", "/", "%"):
                     return "(%s)" % s
+                if parent_op in ("&", "|", "^") and e.op in ("<<", ">>"):
+                    return "(%s)" % s
+                if parent_op in ("|", "^") and e.op == "&":
+                    return "(%s)" % s
                 if my_prec < p_prec:
                     return "(%s)" % s
                 if my_prec == p_prec and is_right and parent_op in ("-", "/", "%"):
@@ -268,11 +272,17 @@ class _Emit:
                     a = self.expr(e.args[0], False)
                     return "((%s >> 1) | (%s << 7))" % (a, a)
             elif e.name in ("rolc", "rolwc"):
-                if len(e.args) == 1:
-                    return "((%s << 1) | CY)" % self.expr(e.args[0], False)
+                if len(e.args) >= 1:
+                    cy_s = self.expr(e.args[1], False) if len(e.args) >= 2 else "CY"
+                    return "((%s << 1) | %s)" % (self.expr(e.args[0], False), cy_s)
             elif e.name == "rorc":
-                if len(e.args) == 1:
-                    return "((%s >> 1) | (CY << 7))" % self.expr(e.args[0], False)
+                if len(e.args) >= 1:
+                    cy_s = self.expr(e.args[1], False) if len(e.args) >= 2 else "CY"
+                    return "((%s >> 1) | (%s << 7))" % (self.expr(e.args[0], False), cy_s)
+            elif e.name == "rorwc":
+                if len(e.args) >= 1:
+                    cy_s = self.expr(e.args[1], False) if len(e.args) >= 2 else "CY"
+                    return "((%s >> 1) | ((uint16_t)%s << 15))" % (self.expr(e.args[0], False), cy_s)
             return "%s(%s)" % (e.name, ", ".join(self.expr(a) for a in e.args))
         return "?"
 

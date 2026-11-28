@@ -44,10 +44,11 @@ ATOM_PAIRS = {
     "e": ("e",),
     "h": ("h",),
     "l": ("l",),
+    "cy": ("cy",),
 }
 
-ALL_ATOMS = ("x", "a", "c", "b", "e", "d", "l", "h")
-CALLER_SAVED_ATOMS = {"x", "a", "c", "b", "e", "d"}
+ALL_ATOMS = ("x", "a", "c", "b", "e", "d", "l", "h", "cy")
+CALLER_SAVED_ATOMS = {"x", "a", "c", "b", "e", "d", "cy"}
 
 
 class _UnionFind:
@@ -71,7 +72,7 @@ class _UnionFind:
 def _is_vvar(name):
     if not isinstance(name, str):
         return False
-    return (name.startswith("v") and name[1:].isdigit()) or name.startswith("_swap_")
+    return (name.startswith("v") and name[1:].isdigit()) or name.startswith("_swap_") or name.startswith("_cy_")
 
 
 def _collect_expr_atoms(e, out):
@@ -1041,9 +1042,14 @@ def _eliminate_dead_assignments(func, hidden, sig=None):
                                 changed = True
                                 any_changed = True
                                 continue
-                    if _is_pure_expr(s.src):
-                        # Check GPRs
-                        if isinstance(s.dst, ir.Reg) and s.dst.name in ALL_GPR:
+                    is_non_sfr_bit = (
+                        isinstance(s.src, ir.Bit) and isinstance(s.src.base, ir.Mem) and
+                        not s.src.base.es and isinstance(s.src.base.addr, int) and
+                        s.src.base.addr < 0xFFF00
+                    )
+                    if _is_pure_expr(s.src) or is_non_sfr_bit:
+                        # Check GPRs and CY
+                        if isinstance(s.dst, ir.Reg) and (s.dst.name in ALL_GPR or s.dst.name == "cy"):
                             atoms = ATOM_PAIRS.get(s.dst.name, (s.dst.name,))
                             if all(use_count.get(a, 0) == 0 for a in atoms) and not any(a in protected_atoms for a in atoms):
                                 changed = True
@@ -1195,6 +1201,9 @@ def recover_variables(func, sig, frame_info):
                 name = p_name
                 is_word = p_is_word
                 break
+
+        if name is None and ("entry", "cy") in members:
+            name = "cy"
 
         if name is None:
             name = f"v{var_counter}"

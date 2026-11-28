@@ -160,11 +160,13 @@ def _fold(e):
             return l
         if isinstance(l, ir.Const) and l.value == 0 and e.op in ("+", "|", "^"):
             return r
+        if isinstance(l, ir.Const) and l.value == 0 and e.op in ("<<", ">>"):
+            return ir.Const(0, l.width)
         if isinstance(r, ir.Const) and r.value == 1 and e.op == "*":
             return l
         if isinstance(l, ir.Const) and l.value == 1 and e.op == "*":
             return r
-        if (isinstance(r, ir.Const) and r.value == 0 and e.op == "*") or (isinstance(l, ir.Const) and l.value == 0 and e.op == "*"):
+        if (isinstance(r, ir.Const) and r.value == 0 and e.op in ("*", "&")) or (isinstance(l, ir.Const) and l.value == 0 and e.op in ("*", "&")):
             return ir.Const(0)
 
         if e.op in ("+", "-"):
@@ -178,6 +180,12 @@ def _fold(e):
                 return ir.Const(0 if sub.value else 1, sub.width)
             if e.op == "~":
                 return ir.Const(~sub.value, sub.width)
+            if e.op == "(uint8_t)":
+                return ir.Const(sub.value & 0xFF, "b")
+            if e.op == "(uint16_t)":
+                return ir.Const(sub.value & 0xFFFF, "w")
+            if e.op == "(uint32_t)":
+                return ir.Const(sub.value & 0xFFFFFFFF, "d")
         return ir.Un(e.op, sub)
     if isinstance(e, ir.Mem):
         return ir.Mem(_fold(e.addr) if isinstance(e.addr, ir.Expr) else e.addr,
@@ -734,7 +742,7 @@ def _eliminate_swap_sandwiches(func):
                                     fa = _subst_reg(m_s.flag.a, acc, other) if m_s.flag.a else None
                                     fb = _subst_reg(m_s.flag.b, acc, other) if m_s.flag.b else None
                                     new_flag = ir.FlagDef(m_s.flag.kind, a=fa, b=fb)
-                                new_middle.append(ir.Assign(m_s.ea, new_dst, new_src, flag=new_flag))
+                                new_middle.append(ir.Assign(m_s.ea, new_dst, new_src, flag=new_flag, cy_op=m_s.cy_op))
                             elif isinstance(m_s, ir.Compare):
                                 fa = _subst_reg(m_s.flag.a, acc, other) if m_s.flag.a else None
                                 fb = _subst_reg(m_s.flag.b, acc, other) if m_s.flag.b else None
@@ -743,6 +751,248 @@ def _eliminate_swap_sandwiches(func):
                         b.stmts = stmts
                         continue
             i += 1
+
+
+def _coalesce_pair_rotates(func):
+    """
+    Combine split 8-bit pair rotates through carry into a single 16-bit rotate:
+      hi = rorc(hi, cy); lo = rorc(lo, cy)  ->  pair = rorwc(pair, cy)
+      lo = rolc(lo, cy); hi = rolc(hi, cy)  ->  pair = rolwc(pair, cy)
+    RL78 lacks a hardware 16-bit rorwc instruction, so compilers emit:
+      rorc a, #1; xch a, x; rorc a, #1; xch a, x
+    which after swap-sandwich elimination becomes rorc(a); rorc(x).
+    """
+    pair_by_halves = {halves: pair for pair, halves in regs.PAIRS.items()}
+
+    def _is_rotc(stmt, op_name):
+        return (
+            isinstance(stmt, ir.Assign)
+            and getattr(stmt, "cy_op", None) == op_name
+            and isinstance(stmt.dst, ir.Reg)
+            and isinstance(stmt.src, ir.IntrExpr)
+            and stmt.src.name == op_name
+            and stmt.src.args
+            and isinstance(stmt.src.args[0], ir.Reg)
+            and stmt.src.args[0].name == stmt.dst.name
+        )
+
+    for b in func.blocks.values():
+        stmts = b.stmts
+        new_stmts = []
+        i = 0
+        while i < len(stmts):
+            s1 = stmts[i]
+            j = i + 1
+            while j < len(stmts) and isinstance(stmts[j], ir.Nop):
+                j += 1
+            if j < len(stmts):
+                s2 = stmts[j]
+                if _is_rotc(s1, "rorc") and _is_rotc(s2, "rorc"):
+                    pair = pair_by_halves.get((s2.dst.name, s1.dst.name))
+                    if pair is not None:
+                        p_reg = ir.Reg(pair, "w")
+                        new_stmts.append(ir.Assign(
+                            s1.ea, p_reg, ir.IntrExpr("rorwc", [p_reg, ir.Reg("cy")]), cy_op="rorwc"
+                        ))
+                        i = j + 1
+                        continue
+                elif _is_rotc(s1, "rolc") and _is_rotc(s2, "rolc"):
+                    pair = pair_by_halves.get((s1.dst.name, s2.dst.name))
+                    if pair is not None:
+                        p_reg = ir.Reg(pair, "w")
+                        new_stmts.append(ir.Assign(
+                            s1.ea, p_reg, ir.IntrExpr("rolwc", [p_reg, ir.Reg("cy")]), cy_op="rolwc"
+                        ))
+                        i = j + 1
+                        continue
+            new_stmts.append(s1)
+            i += 1
+        b.stmts = new_stmts
+
+
+def _lower_carry_ops(func):
+    """
+    Lower shift/rotate/add/sub carry effects into explicit CY assignments where CY is live,
+    and lower rorc/rolc/rolwc/rorwc into explicit shift + carry expressions.
+    Also fuses adjacent non-overlapping shift + rotate-through-carry pairs (e.g. 32-bit shifts).
+    """
+    _SHIFT_OPS = {"shl", "shlw", "shr", "shrw", "sar", "sarw"}
+    _ROTC_OPS = {"rolc", "rolwc", "rorc", "rorwc"}
+
+    def _reads_cy(s):
+        if isinstance(s, ir.Assign):
+            return _mentions_any_atom(s.src, {"cy"})
+        if isinstance(s, ir.Intrinsic):
+            return any(_mentions_any_atom(a, {"cy"}) for a in s.args)
+        if isinstance(s, ir.Branch):
+            if s.cond in ("cy", "ncy") and (s.flag is None or s.flag.kind == "cy"):
+                return True
+            if s.bittest is not None and _mentions_any_atom(s.bittest[0], {"cy"}):
+                return True
+        if isinstance(s, ir.Ret) and s.val is not None:
+            return _mentions_any_atom(s.val, {"cy"})
+        return False
+
+    def _writes_cy(s):
+        if isinstance(s, ir.Assign):
+            if isinstance(s.dst, ir.Reg) and s.dst.name == "cy":
+                return True
+            return getattr(s, "cy_op", None) is not None
+        if isinstance(s, (ir.Compare, ir.Call)):
+            return True
+        if isinstance(s, ir.Intrinsic):
+            if s.name in ("push", "nop", "ei", "di", "sel", "set_bit", "clr_bit"):
+                return False
+            if s.name == "pop" and s.args and isinstance(s.args[0], ir.Reg) and s.args[0].name != "psw":
+                return False
+            return True
+        return False
+
+    # Backward 1-bit liveness for CY across CFG
+    live_in = {ea: False for ea in func.blocks}
+    live_out = {ea: False for ea in func.blocks}
+    ordered = func.ordered()
+    changed = True
+    iters = 0
+    while changed and iters < 32:
+        changed = False
+        iters += 1
+        for b in reversed(ordered):
+            out = any(live_in.get(tgt, False) for _, tgt in b.succ)
+            live_out[b.start] = out
+            cur = out
+            for s in reversed(b.stmts):
+                if _writes_cy(s):
+                    cur = False
+                if _reads_cy(s):
+                    cur = True
+            if cur != live_in[b.start]:
+                live_in[b.start] = cur
+                changed = True
+
+    def _carry_out_expr(s):
+        op = getattr(s, "cy_op", None)
+        dst = s.dst
+        if op in ("shl", "shlw"):
+            bits = 16 if op == "shlw" else 8
+            n = s.src.r.value if (isinstance(s.src, ir.Bin) and isinstance(s.src.r, ir.Const)) else 1
+            if n <= 0:
+                return ir.Const(0)
+            sh = bits - n
+            base = dst if sh <= 0 else ir.Bin(">>", dst, ir.Const(sh))
+            return ir.Bin("&", base, ir.Const(1))
+        if op in ("shr", "shrw", "sar", "sarw"):
+            if isinstance(s.src, ir.Bin) and isinstance(s.src.r, ir.Const):
+                n = s.src.r.value
+            elif isinstance(s.src, ir.IntrExpr) and len(s.src.args) >= 2 and isinstance(s.src.args[1], ir.Const):
+                n = s.src.args[1].value
+            else:
+                n = 1
+            if n <= 0:
+                return ir.Const(0)
+            sh = n - 1
+            base = dst if sh <= 0 else ir.Bin(">>", dst, ir.Const(sh))
+            return ir.Bin("&", base, ir.Const(1))
+        if op in ("rol", "rolc"):
+            return ir.Bin("&", ir.Bin(">>", dst, ir.Const(7)), ir.Const(1))
+        if op == "rolwc":
+            return ir.Bin("&", ir.Bin(">>", dst, ir.Const(15)), ir.Const(1))
+        if op in ("ror", "rorc", "rorwc"):
+            return ir.Bin("&", dst, ir.Const(1))
+        if op == "add" and isinstance(s.src, ir.Bin):
+            return ir.Bin(">", ir.Bin("+", ir.Un("(uint16_t)", dst), s.src.r), ir.Const(0xFF, "w"))
+        if op == "addw" and isinstance(s.src, ir.Bin):
+            return ir.Bin(">", ir.Bin("+", ir.Un("(uint32_t)", dst), s.src.r), ir.Const(0xFFFF, "w"))
+        if op == "addc" and isinstance(s.src, ir.Bin) and isinstance(s.src.l, ir.Bin):
+            return ir.Bin(">", ir.Bin("+", ir.Bin("+", ir.Un("(uint16_t)", dst), s.src.l.r), ir.Reg("cy")), ir.Const(0xFF, "w"))
+        if op in ("sub", "subw") and isinstance(s.src, ir.Bin):
+            return ir.Bin("<", dst, s.src.r)
+        if op == "subc" and isinstance(s.src, ir.Bin) and isinstance(s.src.l, ir.Bin):
+            return ir.Bin("<", ir.Un("(uint16_t)", dst), ir.Bin("+", ir.Un("(uint16_t)", s.src.l.r), ir.Reg("cy")))
+        return None
+
+    def _rotate_result_expr(op, dst, cy_in):
+        if op in ("rolc", "rolwc"):
+            return ir.Bin("|", ir.Bin("<<", dst, ir.Const(1)), cy_in)
+        if op == "rorc":
+            return ir.Bin("|", ir.Bin(">>", dst, ir.Const(1)), ir.Bin("<<", cy_in, ir.Const(7)))
+        if op == "rorwc":
+            return ir.Bin("|", ir.Bin(">>", dst, ir.Const(1)), ir.Bin("<<", ir.Un("(uint16_t)", cy_in), ir.Const(15)))
+        return dst
+
+    tmp_idx = 0
+    for b in ordered:
+        # Compute cy_live_after for each statement in b
+        live_after = [False] * len(b.stmts)
+        cur = live_out[b.start]
+        for idx in range(len(b.stmts) - 1, -1, -1):
+            live_after[idx] = cur
+            st = b.stmts[idx]
+            if _writes_cy(st):
+                cur = False
+            if _reads_cy(st):
+                cur = True
+
+        new_stmts = []
+        i = 0
+        stmts = b.stmts
+        while i < len(stmts):
+            s = stmts[i]
+            op = getattr(s, "cy_op", None) if isinstance(s, ir.Assign) else None
+
+            # Fast path: fuse adjacent shift(r1) + rotc(r2, cy) on disjoint registers
+            if (op in _SHIFT_OPS and isinstance(s.dst, ir.Reg) and s.flag is None and
+                    i + 1 < len(stmts) and isinstance(stmts[i + 1], ir.Assign)):
+                s2 = stmts[i + 1]
+                op2 = getattr(s2, "cy_op", None)
+                if (op2 in _ROTC_OPS and isinstance(s2.dst, ir.Reg) and
+                        not (set(regs.atoms(s.dst.name)) & set(regs.atoms(s2.dst.name)))):
+                    c_mid = _carry_out_expr(s)
+                    if c_mid is not None:
+                        if live_after[i + 1]:
+                            c_out = _carry_out_expr(s2)
+                            if c_out is not None:
+                                new_stmts.append(ir.Assign(s2.ea, ir.Reg("cy"), c_out))
+                        new_stmts.append(ir.Assign(s2.ea, s2.dst, _rotate_result_expr(op2, s2.dst, c_mid)))
+                        new_stmts.append(ir.Assign(s.ea, s.dst, s.src))
+                        i += 2
+                        continue
+
+            if op in _ROTC_OPS:
+                if live_after[i]:
+                    c_out = _carry_out_expr(s)
+                    tmp = ir.Var(f"_cy_{tmp_idx}", width="b")
+                    tmp_idx += 1
+                    new_stmts.append(ir.Assign(s.ea, tmp, c_out))
+                    new_stmts.append(ir.Assign(s.ea, s.dst, _rotate_result_expr(op, s.dst, ir.Reg("cy"))))
+                    new_stmts.append(ir.Assign(s.ea, ir.Reg("cy"), tmp))
+                else:
+                    new_stmts.append(ir.Assign(s.ea, s.dst, _rotate_result_expr(op, s.dst, ir.Reg("cy"))))
+                i += 1
+                continue
+
+            if op is not None and live_after[i]:
+                c_out = _carry_out_expr(s)
+                if c_out is not None:
+                    if op in ("addc", "subc"):
+                        tmp = ir.Var(f"_cy_{tmp_idx}", width="b")
+                        tmp_idx += 1
+                        new_stmts.append(ir.Assign(s.ea, tmp, c_out))
+                        s.cy_op = None
+                        new_stmts.append(s)
+                        new_stmts.append(ir.Assign(s.ea, ir.Reg("cy"), tmp))
+                    else:
+                        new_stmts.append(ir.Assign(s.ea, ir.Reg("cy"), c_out))
+                        s.cy_op = None
+                        new_stmts.append(s)
+                    i += 1
+                    continue
+
+            if isinstance(s, ir.Assign):
+                s.cy_op = None
+            new_stmts.append(s)
+            i += 1
+        b.stmts = new_stmts
 
 
 def _lower_swaps(func):
@@ -980,6 +1230,8 @@ def _opt_block(block, default_bank=0, initial_env=None):
             if s.bittest is not None:
                 base, sense = s.bittest
                 s.bittest = (_fold(_subst(base, env)), sense)
+            if s.flag is not None and s.flag.kind == "cy" and s.flag.a is not None:
+                s.flag.a = _fold(_subst(s.flag.a, env))
 
         elif isinstance(s, ir.Switch):
             s.expr = _fold(_subst(s.expr, env))
@@ -1005,6 +1257,18 @@ def _opt_block(block, default_bank=0, initial_env=None):
                 s.args = [replaced_rhs.get(id(a), a) for a in s.args]
             env.clear()
     _coalesce_block(block)
+    if block.stmts and isinstance(block.stmts[-1], ir.Branch):
+        br = block.stmts[-1]
+        if br.flag is not None and br.flag.kind == "cy" and isinstance(br.flag.a, ir.Const):
+            taken = (br.flag.a.value != 0) if br.cond == "cy" else (br.flag.a.value == 0)
+            if taken:
+                block.stmts[-1] = ir.Goto(br.ea, br.target)
+                block.term = "goto"
+                block.succ = [("jump", br.target)]
+            else:
+                block.stmts.pop()
+                block.term = "fall"
+                block.succ = [("fall", br.fallthrough)]
 
 
 _ES_UNDEF = object()
@@ -1136,13 +1400,32 @@ def _compute_block_es(func, preds):
 def optimize(func, default_bank=0):
     import copy
 
-    # Phase 0: Eliminate accumulator placeholder swap sequences and lower remaining swaps
+    # Phase 0: Eliminate accumulator placeholder swap sequences, coalesce split pair rotates,
+    # lower remaining swaps, and lower shift/rotate/add/sub carry operations
     _eliminate_swap_sandwiches(func)
+    _coalesce_pair_rotates(func)
     _lower_swaps(func)
+    _lower_carry_ops(func)
 
     # Pass 1: Intra-block local optimizations
     for b in func.ordered():
         _opt_block(b, default_bank=default_bank)
+
+    # Prune blocks made unreachable by constant-branch folding (e.g. set1 cy; skc; clr1 cy)
+    if func.entry in func.blocks:
+        reachable = set()
+        work = [func.entry]
+        while work:
+            cur_ea = work.pop()
+            if cur_ea in reachable or cur_ea not in func.blocks:
+                continue
+            reachable.add(cur_ea)
+            for _, succ_ea in func.blocks[cur_ea].succ:
+                if succ_ea in func.blocks and succ_ea not in reachable:
+                    work.append(succ_ea)
+        for ea in list(func.blocks.keys()):
+            if ea not in reachable:
+                del func.blocks[ea]
 
     # Collect single-assigned StackVar / Var constants across func
     var_assigns = {}

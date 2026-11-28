@@ -197,13 +197,14 @@ class FlagDef:
 # ---------------------------------------------------------------------------
 
 class Assign:
-    __slots__ = ("ea", "dst", "src", "flag")
+    __slots__ = ("ea", "dst", "src", "flag", "cy_op")
 
-    def __init__(self, ea, dst, src, flag=None):
+    def __init__(self, ea, dst, src, flag=None, cy_op=None):
         self.ea = ea
         self.dst = dst
         self.src = src
         self.flag = flag
+        self.cy_op = cy_op
 
 
 class Swap:
